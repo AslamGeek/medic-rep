@@ -13,6 +13,7 @@ import {
 } from 'lucide-react'
 import type { Doctor, MasterData, Prescriber } from '../types'
 import { generateDoctorId, normalize, productLabel } from '../utils'
+import { productIdsFromCell, unresolvedProductReferences } from '../../shared/products.js'
 
 interface DoctorFormProps {
   doctor: Doctor | null
@@ -68,7 +69,9 @@ function MasterSelect({
 }
 
 export function DoctorForm({ doctor, doctors, master, onClose, onSave }: DoctorFormProps) {
-  const [form, setForm] = useState<Doctor>(() => doctor ? structuredClone(doctor) : emptyDoctor())
+  const [form, setForm] = useState<Doctor>(() => doctor
+    ? { ...structuredClone(doctor), prescribingProductIds: productIdsFromCell(doctor.prescribingProductIds, master.products) }
+    : emptyDoctor())
   const [error, setError] = useState('')
   const [saving, setSaving] = useState(false)
 
@@ -80,7 +83,7 @@ export function DoctorForm({ doctor, doctors, master, onClose, onSave }: DoctorF
     key: 'specialties' | 'prescribingProductIds',
     value: string,
   ) => {
-    const current = form[key]
+    const current = key === 'prescribingProductIds' ? productIdsFromCell(form[key], master.products) : form[key]
     set(key, current.includes(value) ? current.filter((item) => item !== value) : [...current, value])
   }
 
@@ -102,13 +105,19 @@ export function DoctorForm({ doctor, doctors, master, onClose, onSave }: DoctorF
       return
     }
 
+    const references = form.prescriber === 'Rx' ? form.prescribingProductIds : []
+    const unresolved = unresolvedProductReferences(references, master.products)
+    if (unresolved.length) {
+      setError(`Review prescribing products: ${unresolved.join(', ')}. Remove or reselect these before saving.`)
+      return
+    }
+
     const payload: Doctor = {
       ...form,
       id: form.id || generateDoctorId(form.camp, doctors),
       isNewRecord: !doctor,
       name: form.name.trim(),
-      prescribingProductIds:
-        form.prescriber === 'Rx' ? form.prescribingProductIds : [],
+      prescribingProductIds: productIdsFromCell(references, master.products),
       updatedAt: new Date().toISOString(),
       syncState: 'pending',
     }
@@ -122,6 +131,8 @@ export function DoctorForm({ doctor, doctors, master, onClose, onSave }: DoctorF
   }
 
   const missingMasters = !master.settings.areas.length || !master.settings.camps.length
+  const unresolvedProducts = unresolvedProductReferences(form.prescribingProductIds, master.products)
+  const selectedProductIds = productIdsFromCell(form.prescribingProductIds, master.products)
 
   return (
     <div className="full-screen-layer" role="dialog" aria-modal="true" aria-label={doctor ? 'Edit doctor' : 'Add doctor'}>
@@ -216,15 +227,29 @@ export function DoctorForm({ doctor, doctors, master, onClose, onSave }: DoctorF
         {form.prescriber === 'Rx' && (
           <section className="form-card rx-product-card">
             <div className="form-card-title"><Package size={18} /> Prescribing products</div>
+            {unresolvedProducts.length > 0 && (
+              <div role="alert">
+                <p className="muted-inline">These saved products could not be matched. Remove them below and select the correct products from the list.</p>
+                <div className="chip-row roomy">
+                  {unresolvedProducts.map((reference) => (
+                    <button type="button" className="choice-chip" key={reference}
+                      onClick={() => toggleList('prescribingProductIds', reference)}
+                      aria-label={`Remove unmatched product ${reference}`}>
+                      <X size={13} /> {reference}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
             <div className="chip-row roomy">
               {master.products.map((product) => (
                 <button
                   type="button"
-                  className={`choice-chip ${form.prescribingProductIds.includes(product.prodId) ? 'selected' : ''}`}
+                  className={`choice-chip ${selectedProductIds.includes(product.prodId) ? 'selected' : ''}`}
                   key={product.prodId}
                   onClick={() => toggleList('prescribingProductIds', product.prodId)}
                 >
-                  {form.prescribingProductIds.includes(product.prodId) && <Check size={13} />}
+                  {selectedProductIds.includes(product.prodId) && <Check size={13} />}
                   {productLabel(product)}
                 </button>
               ))}

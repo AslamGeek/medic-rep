@@ -389,7 +389,9 @@ function App() {
       {syncDetail.phase === 'error' && !needsApiSetup && (
         <div className="setup-banner" role="status">
           {syncDetail.message}
-          {syncDetail.pending ? ' Your changes are kept on this device and will retry automatically.' : ' Tap refresh to try again.'}
+          {syncDetail.requiresAttention
+            ? ' Your changes are kept on this device. Edit the named doctor to correct the selection, or refresh after updating the master list.'
+            : syncDetail.pending ? ' Your changes are kept on this device and will retry automatically.' : ' Tap refresh to try again.'}
         </div>
       )}
 

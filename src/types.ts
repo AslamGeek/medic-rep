@@ -70,6 +70,7 @@ export interface QueueItem {
   payload: Doctor | Visit | { visit: Visit }
   createdAt: string
   attempts: number
+  validationError?: string
 }
 
 export interface FilterState {

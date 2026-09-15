@@ -326,6 +326,21 @@ function productLabel_(product) {
   return product.name + (product.dosageForm ? ' (' + product.dosageForm + ')' : '');
 }
 
+// Keep legacy reference matching compatible with shared/products.js.
+function productKey_(value) {
+  return String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+function productFormKey_(value) {
+  var aliases = {
+    tab: 'tabs', tablet: 'tabs', tablets: 'tabs', syrup: 'syr', syrups: 'syr',
+    injection: 'inj', injections: 'inj', suspension: 'susp', suspensions: 'susp',
+    cap: 'caps', capsule: 'caps', capsules: 'caps', sachet: 'sac', sachets: 'sac',
+    'skin cream': 'cream', creams: 'cream', drop: 'drops'
+  };
+  return aliases[productKey_(value)] || productKey_(value);
+}
+
 // IDs remain internal; Sheets stores comma-separated readable product labels.
 // Match complete labels before separators so commas in product names survive.
 function productReferences_(value, products) {
@@ -338,14 +353,15 @@ function productReferences_(value, products) {
       if (Array.isArray(parsed)) return productReferences_(parsed, products);
     } catch (ignored) {}
   }
-  var labels = products.map(productLabel_).sort(function (a, b) { return b.length - a.length; });
+  var patterns = products.map(function (product) { return product.name.trim(); }).filter(Boolean)
+    .sort(function (a, b) { return b.length - a.length; }).map(function (name) {
+      return new RegExp('^' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+')
+        + '(?:\\s*\\([^()]*\\))?(?=\\s*(?:,|\\r?\\n|$))', 'i');
+    });
   var references = [];
   while (text) {
-    var label = labels.filter(function (candidate) {
-      return text.slice(0, candidate.length).toLowerCase() === candidate.toLowerCase()
-        && /^\s*(?:,|\r?\n|$)/.test(text.slice(candidate.length));
-    })[0];
-    var reference = label ? text.slice(0, label.length) : text.split(/,|\r?\n/)[0];
+    var match = patterns.map(function (pattern) { return text.match(pattern); }).filter(Boolean)[0];
+    var reference = match ? match[0] : text.split(/,|\r?\n/)[0];
     references.push(reference.trim());
     text = text.slice(reference.length).replace(/^\s*[,\r\n]\s*/, '').trim();
   }
@@ -354,12 +370,15 @@ function productReferences_(value, products) {
 
 function productIdsFromCell_(value, products) {
   return unique_(productReferences_(value, products).map(function (reference) {
-    var product = products.filter(function (item) {
-      return normalized_(item.prodId) === normalized_(reference);
-    })[0] || products.filter(function (item) {
-      return normalized_(productLabel_(item)) === normalized_(reference);
-    })[0];
-    return product ? product.prodId : reference;
+    var byId = products.filter(function (item) { return productKey_(item.prodId) === productKey_(reference); })[0];
+    if (byId) return byId.prodId;
+    var label = reference.trim().match(/^(.*)\(([^()]*)\)$/);
+    var matches = products.filter(function (item) {
+      return label
+        ? productKey_(item.name) === productKey_(label[1]) && productFormKey_(item.dosageForm) === productFormKey_(label[2])
+        : productKey_(item.name) === productKey_(reference);
+    });
+    return matches.length === 1 ? matches[0].prodId : reference;
   }));
 }
 

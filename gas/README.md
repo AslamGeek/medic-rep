@@ -6,7 +6,7 @@ The app is already configured for spreadsheet:
 
 The current web-app deployment is:
 
-`https://script.google.com/macros/s/AKfycbzKQC-4sk9A-7K3C32W5CZwGkvggkp_jM_p93QJTgcgO_TQX9dSyY3KymzcM3HAHOx4/exec`
+`https://script.google.com/macros/s/AKfycbyXpOujmrKS5oGnxTFiK1Mwd87SQTkEqThcALiZia0_e3RB7Kc02Qf9bmP7pl1E5ifg/exec`
 
 1. Open the Apps Script project used for the web-app URL.
 2. Replace its `Code.gs` with the included `Code.gs`.
@@ -15,7 +15,7 @@ The current web-app deployment is:
    `PROD-001`, `PROD-002`, ... and updates matching doctor references.
 5. Choose **Deploy → Manage deployments → Edit**.
 6. Select **New version**, execute as **Me**, allow access to **Anyone**, and deploy.
-7. Keep the resulting `/exec` URL in `.env` as `VITE_GAS_WEB_APP_URL`. If you updated the supplied deployment, its URL normally remains unchanged.
+7. If Vercel has a `GAS_WEB_APP_URL` environment variable, update it to the resulting `/exec` URL and redeploy. Otherwise the API uses the checked-in default. The local development proxy uses the URL in `vite.config.ts`.
 
 The setup is non-destructive. A blank `Sheet1` is reused as `Doctors`; only the missing agreed tabs and headers are created. Existing rows are not cleared or replaced.
 
@@ -51,3 +51,16 @@ Validate deployment by renaming a known test doctor, checking its Sheets row and
 the **Saved to Sheets** indicator, then editing the name in Sheets and tapping
 refresh. Measure end-to-end write time on the deployed app; local regression tests
 do not establish a production latency guarantee.
+
+## Updating an existing deployment
+
+A GitHub push and Vercel deployment do **not** update Apps Script. Replace the
+Apps Script project's `Code.gs` with this file, save it, then open **Deploy →
+Manage deployments → Edit → Version → New version → Deploy**. Keep the existing
+deployment URL. The previous `setupSpreadsheet` and `normalizeProductIds` setup
+steps do not need to be rerun for this code update.
+
+After both deployments are updated, reopen the app and tap refresh. Queued doctor
+edits can resolve older product labels such as `API-TOP  (Syrup)` to current master
+IDs before resending. Any label that no longer has an unambiguous master match is
+shown in the edit form so the user can remove or reselect it.

@@ -1,4 +1,5 @@
 import type { Doctor, Product, Visit } from './types'
+import { productIdsFromCell } from '../shared/products.js'
 
 export function localDateString(date = new Date()): string {
   const year = date.getFullYear()
@@ -75,15 +76,12 @@ export function doctorProductNames(
   doctor: Doctor,
   products: Product[],
 ): string[] {
-  return doctor.prescribingProductIds.map((id) => {
+  return productIdsFromCell(doctor.prescribingProductIds, products).map((id) => {
     const product = products.find(
       (item) => normalize(item.prodId) === normalize(id),
     )
     if (product) return productLabel(product)
-    const legacy = products.find((item) =>
-      normalize(id).includes(normalize(item.name)),
-    )
-    return legacy ? productLabel(legacy) : id
+    return id
   })
 }
 

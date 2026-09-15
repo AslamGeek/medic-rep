@@ -9,6 +9,8 @@ const products = [
   ['PROD-002', 'Alpha', 'Syrup'],
   ['PROD-003', 'Beta', ''],
   ['PROD-004', 'Gamma, Plus', 'Oral drops'],
+  ['PROD-005', 'API-TOP', 'Syr'],
+  ['PROD-006', 'REGAB-75', 'Tabs'],
 ]
 
 function sheet(rows) {
@@ -96,6 +98,11 @@ test('both read paths resolve labels and legacy IDs to selectable product IDs', 
     ['Gamma, Plus (Oral drops)\nBeta', ['PROD-004', 'PROD-003']],
     ['Gamma, Plus (Oral drops), Alpha (Syrup), Beta', ['PROD-004', 'PROD-002', 'PROD-003']],
     ['["PROD-001","Alpha (Syrup)"]', ['PROD-001', 'PROD-002']],
+    ['API-TOP  (Syrup), REGAB-75  (Tablets)', ['PROD-005', 'PROD-006']],
+    ['  api-top\t (syr) , Gamma, Plus  (Oral drops)', ['PROD-005', 'PROD-004']],
+    ['Alpha', ['Alpha']],
+    ['Alpha (Drops)', ['Alpha (Drops)']],
+    ['[Ljava.lang.Object;@5d23044d', ['[Ljava.lang.Object;@5d23044d']],
     ['Unknown product', ['Unknown product']],
     ['', []],
   ]) {
@@ -115,6 +122,19 @@ test('invalid product IDs are rejected before writing a doctor', () => {
   const { context, sheets, input } = fixture()
   assert.throws(() => context.upsertDoctor_({ ...input, prescribingProductIds: ['missing'] }), /Product must come from/)
   assert.equal(sheets.Doctors.rows.length, 1)
+})
+
+test('editing a legacy doctor and adding a product accepts existing spacing and dosage abbreviations', () => {
+  const { context, sheets, input } = fixture()
+  const created = context.upsertDoctor_(input).doctor
+  const column = sheets.Doctors.rows[0].indexOf('Prescribing Products')
+  sheets.Doctors.rows[1][column] = 'API-TOP  (Syrup), REGAB-75  (Tablets)'
+  const existing = context.getDoctors_()[0]
+  const result = context.upsertDoctor_({ ...existing,
+    prescribingProductIds: [...existing.prescribingProductIds, 'PROD-004'] })
+  assert.equal(result.doctor.id, created.id)
+  assert.deepEqual(Array.from(result.doctor.prescribingProductIds), ['PROD-005', 'PROD-006', 'PROD-004'])
+  assert.equal(sheets.Doctors.rows[1][column], 'API-TOP (Syr), REGAB-75 (Tabs), Gamma, Plus (Oral drops)')
 })
 
 test('normalizing product IDs preserves readable doctor cells', () => {
@@ -139,4 +159,12 @@ test('retrying a new-doctor save returns the assigned doctor ID without adding a
   assert.equal(retry.success, true)
   assert.equal(retry.doctor?.id, first.doctor.id)
   assert.equal(sheets.Doctors.rows.length, 2)
+})
+
+test('equivalent forms with more than one matching master row are not guessed', () => {
+  const { context, sheets } = fixture()
+  sheets.Products.rows.push(['PROD-007', 'API-TOP', 'Syrup'])
+  const products = context.getProducts_()
+  assert.deepEqual(Array.from(context.productIdsFromCell_('API-TOP (Syrup)', products)), ['API-TOP (Syrup)'])
+  assert.deepEqual(Array.from(context.productIdsFromCell_('PROD-007', products)), ['PROD-007'])
 })

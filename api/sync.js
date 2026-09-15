@@ -1,8 +1,9 @@
 import { createHash } from 'node:crypto'
+import { productIdsFromCell } from '../shared/products.js'
 
 const SPREADSHEET_ID = '1Zg5Rxn6TNskev1EFwwrZI9gWP1mDyifBg6ACI_YTFxU'
 const DEFAULT_GAS_WEB_APP_URL =
-  'https://script.google.com/macros/s/AKfycbzKQC-4sk9A-7K3C32W5CZwGkvggkp_jM_p93QJTgcgO_TQX9dSyY3KymzcM3HAHOx4/exec'
+  'https://script.google.com/macros/s/AKfycbyXpOujmrKS5oGnxTFiK1Mwd87SQTkEqThcALiZia0_e3RB7Kc02Qf9bmP7pl1E5ifg/exec'
 
 function parseCsv(text) {
   const rows = []
@@ -58,44 +59,6 @@ function cleanList(value) {
   const text = String(value || '').trim()
   if (!text) return []
   return unique(text.split(/,|\n/).map((item) => item.trim()))
-}
-
-function productLabel(product) {
-  return product.name + (product.dosageForm ? ` (${product.dosageForm})` : '')
-}
-
-// Keep this cell format compatible with productReferences_ in gas/Code.gs.
-function productReferences(value, products) {
-  if (Array.isArray(value)) return unique(value.map((item) => String(item).trim()))
-  let text = String(value || '').trim()
-  if (!text) return []
-  if (text.startsWith('[')) {
-    try {
-      const parsed = JSON.parse(text)
-      if (Array.isArray(parsed)) return productReferences(parsed, products)
-    } catch { /* Also accept manually entered, non-JSON lists. */ }
-  }
-  const labels = products.map(productLabel).sort((a, b) => b.length - a.length)
-  const references = []
-  while (text) {
-    const label = labels.find((candidate) =>
-      text.slice(0, candidate.length).toLowerCase() === candidate.toLowerCase()
-      && /^\s*(?:,|\r?\n|$)/.test(text.slice(candidate.length)),
-    )
-    const reference = label ? text.slice(0, label.length) : text.split(/,|\r?\n/)[0]
-    references.push(reference.trim())
-    text = text.slice(reference.length).replace(/^\s*[,\r\n]\s*/, '').trim()
-  }
-  return unique(references)
-}
-
-function productIdsFromCell(value, products) {
-  return unique(productReferences(value, products).map((reference) => {
-    const key = reference.toLowerCase()
-    const product = products.find((item) => item.prodId.toLowerCase() === key)
-      || products.find((item) => productLabel(item).toLowerCase() === key)
-    return product ? product.prodId : reference
-  }))
 }
 
 function records(csv, sheetName) {

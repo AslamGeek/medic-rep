@@ -37,6 +37,14 @@ not a guaranteed deadline: Apps Script execution and Google response redirects c
 take longer. Both the Vercel app/API and `gas/Code.gs` must be deployed for these
 changes to be active.
 
+Legacy prescribing-product text is matched against the master catalog using
+normalized spacing and dosage abbreviations (for example, `Syrup` and `Syr`).
+The API, doctor form, and queued saves use the same matcher. Unmatched or ambiguous
+products remain visible for correction; they are never silently dropped or guessed.
+Master-list validation failures pause automatic retries. Correcting and saving the
+doctor replaces its rejected edit; refreshing retries it against the current master
+list. Temporary connection failures continue to retry automatically.
+
 The spreadsheet is human-readable and contains only:
 
 - `Doctors`
@@ -56,7 +64,7 @@ The target spreadsheet is currently blank. The included setup safely reuses a bl
 4. Update the web-app deployment to a new version, executing as **Me**, with access for **Anyone**.
 5. Confirm that opening the `/exec` URL shows `"API is ready."`.
 
-The supplied Apps Script URL is the app’s default. To use a different deployment, copy `.env.example` to `.env` and set `VITE_GAS_WEB_APP_URL`. The URL is configured in one place only.
+The supplied Apps Script URL is the default in the Vercel API and local Vite proxy. To override the Vercel API's deployment, set the server-side `GAS_WEB_APP_URL` environment variable in Vercel. The older `VITE_GAS_WEB_APP_URL` variable is not used by the API.
 
 Because the deployment is public, anyone who obtains its URL can call the API. No Google credentials or private service credentials are placed in the browser.
 
@@ -86,7 +94,7 @@ Push this folder to GitHub, import it in Vercel, and keep the defaults:
 - Build command: `npm run build`
 - Output directory: `dist`
 
-If the Apps Script URL changes, add `VITE_GAS_WEB_APP_URL` to the Vercel project’s environment variables and redeploy.
+If the Apps Script URL changes, update `GAS_WEB_APP_URL` in Vercel (if set) and redeploy. An existing override takes precedence over the default URL in the code. Local development uses the default URL in `vite.config.ts`.
 
 ## Master-data behavior
 

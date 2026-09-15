@@ -4,6 +4,7 @@ import {
   WRITE_TIMEOUT_MS,
 } from './config'
 import { db, setMeta } from './db'
+import { productIdsFromCell, unresolvedProductReferences } from '../shared/products.js'
 import type {
   BootstrapPayload,
   Doctor,
@@ -20,6 +21,7 @@ export interface SyncDetail {
   activity?: 'saving' | 'refreshing'
   message?: string
   pending?: number
+  requiresAttention?: boolean
 }
 
 const SYNC_EVENT = 'medrep:sync-status'
@@ -34,14 +36,25 @@ let readError = ''
 let revision = 0
 const doctorChanges = new Map<string, number>()
 
+class ValidationError extends Error {}
+
+function hasRetryableChanges(items: QueueItem[]): boolean {
+  const blocked = new Set(items.filter((item) => item.validationError).map((item) => item.entityId))
+  return items.some((item) => !blocked.has(item.entityId)
+    && !(item.action === 'saveVisit' && (item.payload as Visit).doctorIds.some((id) => blocked.has(id))))
+}
+
 async function report(): Promise<void> {
-  const pending = await db.queue.count()
-  const message = writeError || readError
+  const items = await db.queue.toArray()
+  const pending = items.length
+  const validationError = items.find((item) => item.validationError)?.validationError
+  const message = validationError || writeError || readError
   emit({
     phase: !navigator.onLine ? 'offline' : activeWrites || refreshing ? 'syncing' : message ? 'error' : 'idle',
     activity: activeWrites ? 'saving' : refreshing ? 'refreshing' : undefined,
     message: message || (pending ? 'Waiting to save to Sheets' : 'Saved to Sheets'),
     pending,
+    requiresAttention: Boolean(validationError),
   })
 }
 
@@ -124,18 +137,31 @@ async function getBootstrap(): Promise<BootstrapPayload> {
 }
 
 async function postOperation(item: QueueItem): Promise<Record<string, unknown>> {
+  let payload = item.payload
+  if (item.action === 'upsertDoctor') {
+    const doctor = payload as Doctor
+    const master = (await db.meta.get('master'))?.value as MasterData | undefined
+    if (master?.products) {
+      const references = doctor.prescriber === 'NRx' ? [] : doctor.prescribingProductIds
+      const unresolved = unresolvedProductReferences(references, master.products)
+      if (unresolved.length) throw new ValidationError(`Review prescribing products: ${unresolved.join(', ')}. Remove or reselect these from the current list.`)
+      payload = { ...doctor, prescribingProductIds: productIdsFromCell(references, master.products) }
+    }
+  }
   const data = await fetchJson<Record<string, unknown>>(SYNC_API_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'text/plain;charset=utf-8' },
     body: JSON.stringify({
       action: item.action,
       opId: item.opId,
-      payload: item.payload,
+      payload,
     }),
     keepalive: true,
   }, WRITE_TIMEOUT_MS)
   if (data.success !== true) {
-    throw new Error(String(data.message || 'A queued change could not be saved'))
+    const message = String(data.message || 'A queued change could not be saved')
+    if (/must come from the spreadsheet master list/.test(message)) throw new ValidationError(message)
+    throw new Error(message)
   }
   if (item.action === 'upsertDoctor' && typeof (data.doctor as Doctor | undefined)?.id !== 'string') {
     throw new Error('Sheets has not confirmed this doctor yet. The save will retry.')
@@ -150,6 +176,22 @@ export async function queueChange(
 ): Promise<string> {
   const opId = crypto.randomUUID()
   await db.transaction('rw', db.queue, db.doctors, db.visits, async () => {
+    if (action === 'upsertDoctor') {
+      const previous = (await db.queue.where('entityId').equals(entityId).toArray())
+        .filter((item) => item.action === 'upsertDoctor')
+      const rejected = previous.find((item) => item.validationError)
+      if (rejected) {
+        payload = { ...payload as Doctor,
+          isNewRecord: (rejected.payload as Doctor).isNewRecord || (payload as Doctor).isNewRecord }
+        // Only replace definite rejections and later edits that were never sent.
+        // A timed-out request may already have reached Sheets and must keep its receipt.
+        for (const item of previous) {
+          if (item.validationError || (item.id! > rejected.id! && item.attempts === 0)) {
+            await db.queue.delete(item.id!)
+          }
+        }
+      }
+    }
     if (action === 'upsertDoctor') await db.doctors.put({ ...payload as Doctor, syncState: 'pending' })
     if (action === 'saveVisit') await db.visits.put({ ...payload as Visit, syncState: 'pending' })
     if (action === 'undoVisit') await db.visits.delete(entityId)
@@ -169,6 +211,7 @@ async function pushQueue(): Promise<void> {
   for (const queued of items) {
     const item = queued.id === undefined ? undefined : await db.queue.get(queued.id)
     if (!item || blockedEntities.has(item.entityId)) continue
+    if (item.validationError) { blockedEntities.add(item.entityId); continue }
     try {
       if (item.action === 'saveVisit') {
         const visit = item.payload as Visit
@@ -225,10 +268,15 @@ async function pushQueue(): Promise<void> {
         if (item.action === 'undoVisit') revision += 1
         if (item.id !== undefined) await db.queue.delete(item.id)
       })
+      await report()
     } catch (error) {
       blockedEntities.add(item.entityId)
       if (item.id !== undefined) {
-        await db.queue.update(item.id, { attempts: item.attempts + 1 })
+        await db.queue.update(item.id, {
+          attempts: item.attempts + 1,
+          validationError: error instanceof ValidationError
+            ? `${(item.payload as Doctor).name || 'Doctor'}: ${error.message}` : undefined,
+        })
       }
       failures.push(error instanceof Error ? error.message : 'A queued change could not be saved')
     }
@@ -301,6 +349,11 @@ async function performSync(): Promise<void> {
     const bootstrap = await getBootstrap()
     await applyBootstrap(bootstrap, startedAt)
     await setMeta('lastSuccessfulSync', new Date().toISOString())
+    // A requested refresh may bring a corrected master list or backend deployment.
+    // Retry rejected edits once against the newly loaded data, without a retry loop.
+    const rejected = (await db.queue.toArray()).filter((item) => item.validationError)
+    for (const item of rejected) await db.queue.update(item.id!, { validationError: undefined })
+    if (rejected.length) await flushChanges()
   } catch (error) {
     readError = error instanceof Error ? error.message : 'Could not refresh from Sheets'
   } finally {
@@ -327,7 +380,7 @@ export function flushChanges(): Promise<void> {
   }).finally(async () => {
     activeWrites = null
     await report()
-    if (await db.queue.count() && navigator.onLine) {
+    if (hasRetryableChanges(await db.queue.toArray()) && navigator.onLine) {
       retryTimer = window.setTimeout(() => { void flushChanges() }, retryDelay)
       retryDelay = Math.min(retryDelay * 2, 30_000)
     }

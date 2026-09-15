@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import vm from 'node:vm'
 import test from 'node:test'
 import ts from 'typescript'
+import * as productReferences from '../shared/products.js'
 
 const clone = (value) => value === undefined ? undefined : structuredClone(value)
 function table(key) {
@@ -56,6 +57,7 @@ function setup(fetch) {
     require: (name) => {
       if (name === './db') return { db, setMeta: (key, value) => db.meta.put({ key, value }) }
       if (name === './config') return { SYNC_API_URL: '/api/sync', READ_TIMEOUT_MS: 12000, WRITE_TIMEOUT_MS: 55000 }
+      if (name === '../shared/products.js') return productReferences
       throw new Error(`Unexpected import: ${name}`)
     },
     fetch,
@@ -226,4 +228,40 @@ test('on-demand refresh imports direct Sheet edits when no local change is pendi
   await db.doctors.put({ ...doctor, syncState: 'synced' })
   await sync.syncNow()
   assert.equal((await db.doctors.get(doctor.id)).name, 'Name edited in Sheets')
+})
+
+test('an already queued specialty edit repairs legacy product labels before sending', async () => {
+  let sent
+  const { db, sync } = setup(async (_url, init) => {
+    sent = JSON.parse(init.body).payload
+    return response({ success: true, doctor: sent })
+  })
+  await db.meta.put({ key: 'master', value: { products: [{ prodId: 'PROD-006', name: 'API-TOP', dosageForm: 'Syr' }] } })
+  const queued = { ...doctor, prescriber: 'Rx', specialties: ['General'], prescribingProductIds: ['API-TOP  (Syrup)'] }
+  await db.queue.add({ id: 1, opId: 'old-op', action: 'upsertDoctor', entityId: doctor.id, payload: queued, attempts: 8 })
+  await sync.flushChanges()
+  assert.deepEqual(sent.prescribingProductIds, ['PROD-006'])
+  assert.deepEqual(sent.specialties, ['General'])
+  assert.equal(await db.queue.count(), 0)
+})
+
+test('a validation rejection pauses automatic retry and a corrected edit replaces it', async () => {
+  const sent = []
+  const { db, sync, timers } = setup(async (_url, init) => {
+    const operation = JSON.parse(init.body)
+    sent.push(operation)
+    return operation.payload.name === 'Invalid edit'
+      ? response({ success: false, message: 'Product must come from the spreadsheet master list.' })
+      : response({ success: true, doctor: operation.payload })
+  })
+  await sync.queueChange('upsertDoctor', doctor.id, { ...doctor, name: 'Invalid edit' })
+  await sync.flushChanges()
+  assert.ok((await db.queue.toArray())[0].validationError)
+  assert.equal([...timers.values()].some((timer) => timer.delay <= 30000), false)
+  await sync.queueChange('upsertDoctor', doctor.id, { ...doctor, name: 'Corrected edit' })
+  await sync.flushChanges()
+  assert.equal(sent.length, 2)
+  assert.notEqual(sent[0].opId, sent[1].opId)
+  assert.equal(sent[1].payload.name, 'Corrected edit')
+  assert.equal(await db.queue.count(), 0)
 })
