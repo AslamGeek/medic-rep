@@ -12,7 +12,7 @@
 var CONFIG = {
   SPREADSHEET_ID: '1Zg5Rxn6TNskev1EFwwrZI9gWP1mDyifBg6ACI_YTFxU',
   TIME_ZONE: 'Asia/Kolkata',
-  MAX_REMEMBERED_OPERATIONS: 250
+  MAX_REMEMBERED_OPERATIONS: 100
 };
 
 // Reuse the spreadsheet handle during one Apps Script invocation. Opening the
@@ -70,6 +70,7 @@ function doGet(e) {
 }
 
 function doPost(e) {
+  var operationLock = null;
   try {
     var request = JSON.parse((e && e.postData && e.postData.contents) || '{}');
     var action = String(request.action || '');
@@ -77,19 +78,40 @@ function doPost(e) {
     var payload = request.payload || {};
 
     if (!opId) throw new Error('Operation ID is required.');
-    if (wasProcessed_(opId)) return json_({ success: true, duplicate: true });
+    operationLock = LockService.getScriptLock();
+    operationLock.waitLock(20000);
+    if (wasProcessed_(opId)) {
+      var previous = { success: true, duplicate: true };
+      if (action === 'upsertDoctor') {
+        var savedId = PropertiesService.getScriptProperties().getProperty('MEDREP_DOCTOR_OP_' + opId);
+        var matches = getDoctors_().filter(function (doctor) {
+          if (savedId) return doctor.id === savedId;
+          // Compatibility with receipts written by the previous deployment.
+          return payload.isNewRecord
+            ? normalized_(doctor.name) === normalized_(payload.name) && normalized_(doctor.hospital) === normalized_(payload.hospital)
+            : doctor.id === payload.id;
+        });
+        if (matches.length !== 1) throw new Error('Could not recover the saved doctor. Refresh and check the record.');
+        previous.doctor = matches[0];
+      }
+      return json_(previous);
+    }
 
     var result;
-    if (action === 'upsertDoctor') result = upsertDoctor_(payload);
-    else if (action === 'saveVisit') result = saveVisit_(payload);
-    else if (action === 'undoVisit') result = undoVisit_(payload.visit || payload);
+    if (action === 'upsertDoctor') result = upsertDoctor_(payload, true);
+    else if (action === 'saveVisit') result = saveVisit_(payload, true);
+    else if (action === 'undoVisit') result = undoVisit_(payload.visit || payload, true);
     else throw new Error('Unsupported action: ' + action);
 
-    rememberOperation_(opId);
+    // Commit buffered Sheet writes before confirming the save or releasing the lock.
+    SpreadsheetApp.flush();
+    rememberOperation_(opId, result);
     result.success = true;
     return json_(result);
   } catch (error) {
     return jsonError_(error);
+  } finally {
+    if (operationLock) operationLock.releaseLock();
   }
 }
 
@@ -264,10 +286,8 @@ function jsonError_(error) {
 
 function getSettings_() {
   var sheet = sheet_('Settings');
-  var headers = readHeaders_(sheet);
-  var values = sheet.getLastRow() > 1
-    ? sheet.getRange(2, 1, sheet.getLastRow() - 1, headers.length).getDisplayValues()
-    : [];
+  var values = sheet.getDataRange().getDisplayValues();
+  var headers = values.shift().map(function (value) { return String(value).trim(); });
 
   function column(name) {
     var index = columnIndex_(headers, name);
@@ -287,9 +307,8 @@ function getSettings_() {
 
 function getProducts_() {
   var sheet = sheet_('Products');
-  var headers = readHeaders_(sheet);
-  if (sheet.getLastRow() <= 1) return [];
-  var rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, headers.length).getDisplayValues();
+  var rows = sheet.getDataRange().getDisplayValues();
+  var headers = rows.shift().map(function (value) { return String(value).trim(); });
   return rows.map(function (row) {
     return {
       prodId: cleanText_(valueAt_(headers, row, 'ProdID'), 100),
@@ -301,6 +320,47 @@ function getProducts_() {
 
 function formatProductId_(sequence) {
   return 'PROD-' + ('000' + sequence).slice(-Math.max(3, String(sequence).length));
+}
+
+function productLabel_(product) {
+  return product.name + (product.dosageForm ? ' (' + product.dosageForm + ')' : '');
+}
+
+// IDs remain internal; Sheets stores comma-separated readable product labels.
+// Match complete labels before separators so commas in product names survive.
+function productReferences_(value, products) {
+  if (Array.isArray(value)) return unique_(value.map(function (item) { return String(item).trim(); }));
+  var text = String(value || '').trim();
+  if (!text) return [];
+  if (text.charAt(0) === '[') {
+    try {
+      var parsed = JSON.parse(text);
+      if (Array.isArray(parsed)) return productReferences_(parsed, products);
+    } catch (ignored) {}
+  }
+  var labels = products.map(productLabel_).sort(function (a, b) { return b.length - a.length; });
+  var references = [];
+  while (text) {
+    var label = labels.filter(function (candidate) {
+      return text.slice(0, candidate.length).toLowerCase() === candidate.toLowerCase()
+        && /^\s*(?:,|\r?\n|$)/.test(text.slice(candidate.length));
+    })[0];
+    var reference = label ? text.slice(0, label.length) : text.split(/,|\r?\n/)[0];
+    references.push(reference.trim());
+    text = text.slice(reference.length).replace(/^\s*[,\r\n]\s*/, '').trim();
+  }
+  return unique_(references);
+}
+
+function productIdsFromCell_(value, products) {
+  return unique_(productReferences_(value, products).map(function (reference) {
+    var product = products.filter(function (item) {
+      return normalized_(item.prodId) === normalized_(reference);
+    })[0] || products.filter(function (item) {
+      return normalized_(productLabel_(item)) === normalized_(reference);
+    })[0];
+    return product ? product.prodId : reference;
+  }));
 }
 
 /**
@@ -399,19 +459,20 @@ function normalizeProductIds_(ss) {
 
   var updatedDoctors = 0;
   if (doctorSheet && doctorSheet.getLastRow() > 1 && Object.keys(replacements).length) {
+    var products = getProducts_();
     var doctorHeaders = readHeaders_(doctorSheet);
     var productIndex = columnIndex_(doctorHeaders, 'Prescribing Products');
     var doctorRowCount = doctorSheet.getLastRow() - 1;
     var referenceRange = doctorSheet.getRange(2, productIndex + 1, doctorRowCount, 1);
     var referenceValues = referenceRange.getDisplayValues().map(function (row) {
       var changed = false;
-      var values = cleanList_(row[0]).map(function (value) {
+      var values = productReferences_(row[0], products).map(function (value) {
         var replacement = replacements[normalized_(value)];
         if (replacement) changed = true;
         return replacement || value;
       });
       if (changed) updatedDoctors += 1;
-      return [values.join(', ')];
+      return [changed ? values.join(', ') : row[0]];
     });
     referenceRange.setValues(referenceValues);
   }
@@ -432,7 +493,7 @@ function handleProductEdit_(e) {
   }
 }
 
-function doctorFromRow_(headers, row) {
+function doctorFromRow_(headers, row, products) {
   var id = cleanText_(valueAt_(headers, row, 'ID'), 120);
   if (!id) return null;
   return {
@@ -448,19 +509,20 @@ function doctorFromRow_(headers, row) {
     prescriber: normalizedPrescriber_(valueAt_(headers, row, 'Prescriber')),
     opTiming: cleanText_(valueAt_(headers, row, 'OP Timing'), 120),
     callSchedule: cleanText_(valueAt_(headers, row, 'Call Schedule'), 120),
-    prescribingProductIds: cleanList_(valueAt_(headers, row, 'Prescribing Products')),
+    prescribingProductIds: productIdsFromCell_(valueAt_(headers, row, 'Prescribing Products'), products),
     notes: cleanText_(valueAt_(headers, row, 'Notes'), 500),
     updatedAt: new Date().toISOString(),
     syncState: 'synced'
   };
 }
 
-function getDoctors_() {
+function getDoctors_(products) {
   var sheet = sheet_('Doctors');
-  var headers = readHeaders_(sheet);
-  if (sheet.getLastRow() <= 1) return [];
-  return sheet.getRange(2, 1, sheet.getLastRow() - 1, headers.length).getValues()
-    .map(function (row) { return doctorFromRow_(headers, row); })
+  var rows = sheet.getDataRange().getValues();
+  var headers = rows.shift().map(function (value) { return String(value).trim(); });
+  products = products || getProducts_();
+  return rows
+    .map(function (row) { return doctorFromRow_(headers, row, products); })
     .filter(Boolean);
 }
 
@@ -471,9 +533,8 @@ function validateChoice_(label, value, allowed, optional) {
   return match;
 }
 
-function validateDoctor_(input) {
+function validateDoctor_(input, products) {
   var settings = getSettings_();
-  var products = getProducts_();
   var productIds = products.map(function (product) { return product.prodId; });
   var prescriber = normalizedPrescriber_(input.prescriber);
   var specialties = cleanList_(input.specialties).map(function (value) {
@@ -494,7 +555,7 @@ function validateDoctor_(input) {
     opTiming: validateChoice_('OP timing', cleanText_(input.opTiming, 120), settings.opTimings, true),
     callSchedule: validateChoice_('Call schedule', cleanText_(input.callSchedule, 120), settings.callSchedules, true),
     prescribingProductIds: prescriber === 'Rx'
-      ? cleanList_(input.prescribingProductIds).map(function (value) {
+      ? productIdsFromCell_(input.prescribingProductIds, products).map(function (value) {
           return validateChoice_('Product', value, productIds, false);
         })
       : [],
@@ -507,7 +568,7 @@ function validateDoctor_(input) {
   return doctor;
 }
 
-function doctorCellValue_(doctor, canonical) {
+function doctorCellValue_(doctor, canonical, products) {
   var map = {
     'ID': doctor.id,
     'Name': doctor.name,
@@ -521,24 +582,24 @@ function doctorCellValue_(doctor, canonical) {
     'Prescriber': doctor.prescriber,
     'OP Timing': doctor.opTiming,
     'Call Schedule': doctor.callSchedule,
-    'Prescribing Products': doctor.prescribingProductIds.join(', '),
+    'Prescribing Products': doctor.prescribingProductIds.map(function (id) {
+      return productLabel_(products.filter(function (product) { return product.prodId === id; })[0]);
+    }).join(', '),
     'Notes': doctor.notes
   };
   return map[canonical];
 }
 
-function upsertDoctor_(input) {
+function upsertDoctor_(input, lockHeld) {
   var isNewRecord = input && input.isNewRecord === true;
-  var doctor = validateDoctor_(input);
+  var products = getProducts_();
+  var doctor = validateDoctor_(input, products);
   var lock = LockService.getScriptLock();
-  lock.waitLock(20000);
+  if (!lockHeld) lock.waitLock(20000);
   try {
     var sheet = sheet_('Doctors');
-    var headers = readHeaders_(sheet);
-    var lastRow = sheet.getLastRow();
-    var rows = lastRow > 1
-      ? sheet.getRange(2, 1, lastRow - 1, headers.length).getValues()
-      : [];
+    var rows = sheet.getDataRange().getValues();
+    var headers = rows.shift().map(function (value) { return String(value).trim(); });
     var idIndex = columnIndex_(headers, 'ID');
     var nameIndex = columnIndex_(headers, 'Name');
     var hospitalIndex = columnIndex_(headers, 'Hospital');
@@ -559,11 +620,11 @@ function upsertDoctor_(input) {
     });
 
     var existingRow = rowNumber > 0
-      ? sheet.getRange(rowNumber, 1, 1, headers.length).getValues()[0]
+      ? rows[rowNumber - 2].slice()
       : new Array(headers.length).fill('');
 
     SHEET_HEADERS.Doctors.forEach(function (canonical) {
-      existingRow[columnIndex_(headers, canonical)] = doctorCellValue_(doctor, canonical);
+      existingRow[columnIndex_(headers, canonical)] = doctorCellValue_(doctor, canonical, products);
     });
 
     if (rowNumber > 0) {
@@ -573,7 +634,7 @@ function upsertDoctor_(input) {
     }
     return { doctor: doctor };
   } finally {
-    lock.releaseLock();
+    if (!lockHeld) lock.releaseLock();
   }
 }
 
@@ -591,7 +652,7 @@ function validateVisitDate_(value) {
   return date;
 }
 
-function saveVisit_(input) {
+function saveVisit_(input, lockHeld) {
   var date = validateVisitDate_(input.date);
   var camp = cleanText_(input.camp, 120);
   var kind = cleanText_(input.kind, 20) || 'Visit';
@@ -626,7 +687,7 @@ function saveVisit_(input) {
   }
 
   var lock = LockService.getScriptLock();
-  lock.waitLock(20000);
+  if (!lockHeld) lock.waitLock(20000);
   try {
     var sheet = sheet_('Visits');
     var headers = readHeaders_(sheet);
@@ -644,18 +705,18 @@ function saveVisit_(input) {
     sheet.getRange(2, columnIndex_(headers, 'Pharmacy') + 1).setWrap(true);
     return { visit: visitFromRow_(headers, row, 2), doctorIds: doctorIds };
   } finally {
-    lock.releaseLock();
+    if (!lockHeld) lock.releaseLock();
   }
 }
 
-function undoVisit_(input) {
+function undoVisit_(input, lockHeld) {
   var targetDate = cleanText_(input.date, 20);
   var targetCamp = cleanText_(input.camp, 120);
   var targetDoctors = Array.isArray(input.doctorLines)
     ? input.doctorLines.map(function (line) { return cleanText_(line, 1000); }).filter(Boolean).join('\n')
     : cleanText_(input.doctorLines, 5000).replace(/\r\n/g, '\n');
   var lock = LockService.getScriptLock();
-  lock.waitLock(20000);
+  if (!lockHeld) lock.waitLock(20000);
   try {
     var sheet = sheet_('Visits');
     var headers = readHeaders_(sheet);
@@ -677,7 +738,7 @@ function undoVisit_(input) {
     }
     return { removed: false };
   } finally {
-    lock.releaseLock();
+    if (!lockHeld) lock.releaseLock();
   }
 }
 
@@ -720,9 +781,8 @@ function visitFromRow_(headers, row, sheetRow) {
 
 function getVisits_() {
   var sheet = sheet_('Visits');
-  var headers = readHeaders_(sheet);
-  if (sheet.getLastRow() <= 1) return [];
-  var rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, headers.length).getValues();
+  var rows = sheet.getDataRange().getValues();
+  var headers = rows.shift().map(function (value) { return String(value).trim(); });
   return rows.map(function (row, index) { return visitFromRow_(headers, row, index + 2); })
     .filter(function (visit) { return visit.date; })
     .sort(function (a, b) {
@@ -732,12 +792,13 @@ function getVisits_() {
 }
 
 function bootstrap_() {
+  var products = getProducts_();
   return {
     success: true,
-    doctors: getDoctors_(),
+    doctors: getDoctors_(products),
     visits: getVisits_(),
     settings: getSettings_(),
-    products: getProducts_(),
+    products: products,
     serverTime: new Date().toISOString()
   };
 }
@@ -757,13 +818,16 @@ function wasProcessed_(opId) {
   return processedOperations_().indexOf(opId) !== -1;
 }
 
-function rememberOperation_(opId) {
+function rememberOperation_(opId, result) {
+  var properties = PropertiesService.getScriptProperties();
+  if (result.doctor) properties.setProperty('MEDREP_DOCTOR_OP_' + opId, result.doctor.id);
   var operations = processedOperations_();
   operations.push(opId);
-  if (operations.length > CONFIG.MAX_REMEMBERED_OPERATIONS) {
-    operations = operations.slice(operations.length - CONFIG.MAX_REMEMBERED_OPERATIONS);
+  // Leave room below the per-property size limit, even for non-UUID IDs.
+  while (operations.length > CONFIG.MAX_REMEMBERED_OPERATIONS || JSON.stringify(operations).length > 2000) {
+    properties.deleteProperty('MEDREP_DOCTOR_OP_' + operations.shift());
   }
-  PropertiesService.getScriptProperties().setProperty(
+  properties.setProperty(
     'MEDREP_PROCESSED_OPS',
     JSON.stringify(operations)
   );

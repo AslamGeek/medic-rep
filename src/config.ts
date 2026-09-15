@@ -6,8 +6,7 @@ export const SPREADSHEET_ID =
 export const SYNC_API_URL =
   import.meta.env.VITE_SYNC_API_URL || '/api/sync'
 
-export const READ_TIMEOUT_MS = 12_000
+export const READ_TIMEOUT_MS = 55_000
 export const WRITE_TIMEOUT_MS = 55_000
-export const FOREGROUND_SYNC_INTERVAL_MS = 60_000
 export const UNDO_WINDOW_MS = 8_000
 export const MAX_VISIBLE_DOCTORS = 100

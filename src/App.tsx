@@ -17,7 +17,6 @@ import {
 import './App.css'
 import {
   APP_NAME,
-  FOREGROUND_SYNC_INTERVAL_MS,
   UNDO_WINDOW_MS,
 } from './config'
 import { db, DEFAULT_MASTER, loadSnapshot } from './db'
@@ -94,10 +93,10 @@ function SyncBadge({
 }) {
   const content = (() => {
     if (detail.phase === 'offline') return { icon: <WifiOff size={13} />, label: detail.pending ? `${detail.pending} offline` : 'Offline' }
-    if (detail.phase === 'syncing') return { icon: <RefreshCw className="spin" size={13} />, label: 'Saving' }
-    if (detail.phase === 'error') return { icon: <CloudOff size={13} />, label: detail.pending ? `${detail.pending} pending` : 'Local only' }
+    if (detail.phase === 'syncing') return { icon: <RefreshCw className="spin" size={13} />, label: detail.activity === 'saving' ? 'Saving to Sheets' : 'Refreshing' }
+    if (detail.phase === 'error') return { icon: <CloudOff size={13} />, label: detail.pending ? `${detail.pending} pending` : 'Refresh failed' }
     if (detail.pending) return { icon: <RefreshCw size={13} />, label: `${detail.pending} queued` }
-    return { icon: <Check size={13} />, label: 'Saved' }
+    return { icon: <Check size={13} />, label: 'Saved to Sheets' }
   })()
   return (
     <button
@@ -134,7 +133,8 @@ function App() {
   const [snapshot, setSnapshot] = useState<AppSnapshot>(EMPTY_SNAPSHOT)
   const [loading, setLoading] = useState(true)
   const [syncDetail, setSyncDetail] = useState<SyncDetail>({
-    phase: navigator.onLine ? 'idle' : 'offline',
+    phase: navigator.onLine ? 'syncing' : 'offline',
+    activity: 'refreshing',
     pending: 0,
   })
   const [dailyCamp, setDailyCamp] = useState(readDailyCamp)
@@ -256,11 +256,6 @@ function App() {
     window.addEventListener('offline', offline)
     window.addEventListener('beforeinstallprompt', beforeInstall)
     document.addEventListener('visibilitychange', visible)
-    const periodicSync = window.setInterval(() => {
-      if (document.visibilityState === 'visible') {
-        void syncNow().then(reload)
-      }
-    }, FOREGROUND_SYNC_INTERVAL_MS)
     void syncNow().then(reload)
 
     return () => {
@@ -271,7 +266,6 @@ function App() {
       window.removeEventListener('offline', offline)
       window.removeEventListener('beforeinstallprompt', beforeInstall)
       document.removeEventListener('visibilitychange', visible)
-      window.clearInterval(periodicSync)
     }
   }, [acceptSnapshot, reload])
 
@@ -280,33 +274,22 @@ function App() {
   }, [])
 
   const saveDoctor = async (doctor: Doctor) => {
-    await db.doctors.put(doctor)
     await queueChange('upsertDoctor', doctor.id, doctor)
     await reload()
     setEditingDoctor(undefined)
     setSelectedDoctor(doctor)
-    showToast({ message: 'Doctor saved locally', durationMs: 3_000 })
-    void syncNow().then(reload)
+    showToast({ message: navigator.onLine ? 'Doctor updated. Saving to Sheets…' : 'Doctor saved on this device. Will send when online.', durationMs: 3_000 })
   }
 
   const undoVisit = async (visit: Visit) => {
-    const pending = await db.queue
-      .where('entityId')
-      .equals(visit.localId)
-      .filter((item) => item.action === 'saveVisit')
-      .first()
-    await db.transaction('rw', db.queue, db.visits, async () => {
-      if (pending?.id !== undefined) await db.queue.delete(pending.id)
-      await db.visits.delete(visit.localId)
-    })
-    if (!pending) await queueChange('undoVisit', visit.localId, { visit })
+    const savedVisit = await db.visits.get(visit.localId)
+    // Keep save and undo ordered, including when the save request is in flight.
+    await queueChange('undoVisit', visit.localId, { visit: savedVisit ?? visit })
     await reload()
     showToast({ message: 'Visit removed' })
-    void syncNow().then(reload)
   }
 
   const saveVisit = async (visit: Visit) => {
-    await db.visits.put(visit)
     await queueChange('saveVisit', visit.localId, visit)
     await reload()
     showToast({
@@ -314,7 +297,6 @@ function App() {
       actionLabel: 'Undo',
       action: () => void undoVisit(visit),
     })
-    void syncNow().then(reload)
   }
 
   const savePreset = async (name: string, nextFilters: FilterState) => {
@@ -404,6 +386,13 @@ function App() {
         </div>
       </header>
 
+      {syncDetail.phase === 'error' && !needsApiSetup && (
+        <div className="setup-banner" role="status">
+          {syncDetail.message}
+          {syncDetail.pending ? ' Your changes are kept on this device and will retry automatically.' : ' Tap refresh to try again.'}
+        </div>
+      )}
+
       {needsApiSetup && (
         <div className="setup-banner">
           <CloudOff size={18} />
@@ -478,7 +467,7 @@ function App() {
           products={snapshot.master.products}
           visits={snapshot.visits}
           onClose={() => setSelectedDoctor(null)}
-          onEdit={() => { setEditingDoctor(selectedDoctor); setSelectedDoctor(null) }}
+          onEdit={() => { setEditingDoctor(snapshot.doctors.find((doctor) => doctor.id === selectedDoctor.id) ?? selectedDoctor); setSelectedDoctor(null) }}
           onLogVisit={logFromDoctor}
         />
       )}

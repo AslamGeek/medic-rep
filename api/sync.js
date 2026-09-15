@@ -60,9 +60,56 @@ function cleanList(value) {
   return unique(text.split(/,|\n/).map((item) => item.trim()))
 }
 
-function records(csv) {
+function productLabel(product) {
+  return product.name + (product.dosageForm ? ` (${product.dosageForm})` : '')
+}
+
+// Keep this cell format compatible with productReferences_ in gas/Code.gs.
+function productReferences(value, products) {
+  if (Array.isArray(value)) return unique(value.map((item) => String(item).trim()))
+  let text = String(value || '').trim()
+  if (!text) return []
+  if (text.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(text)
+      if (Array.isArray(parsed)) return productReferences(parsed, products)
+    } catch { /* Also accept manually entered, non-JSON lists. */ }
+  }
+  const labels = products.map(productLabel).sort((a, b) => b.length - a.length)
+  const references = []
+  while (text) {
+    const label = labels.find((candidate) =>
+      text.slice(0, candidate.length).toLowerCase() === candidate.toLowerCase()
+      && /^\s*(?:,|\r?\n|$)/.test(text.slice(candidate.length)),
+    )
+    const reference = label ? text.slice(0, label.length) : text.split(/,|\r?\n/)[0]
+    references.push(reference.trim())
+    text = text.slice(reference.length).replace(/^\s*[,\r\n]\s*/, '').trim()
+  }
+  return unique(references)
+}
+
+function productIdsFromCell(value, products) {
+  return unique(productReferences(value, products).map((reference) => {
+    const key = reference.toLowerCase()
+    const product = products.find((item) => item.prodId.toLowerCase() === key)
+      || products.find((item) => productLabel(item).toLowerCase() === key)
+    return product ? product.prodId : reference
+  }))
+}
+
+function records(csv, sheetName) {
   const rows = parseCsv(csv)
   const headers = rows.shift() || []
+  const required = {
+    Doctors: ['ID', 'Name', 'Specialties', 'Hospital', 'Pharmacy', 'Area', 'Camp', 'Potential', 'Stockist', 'Prescriber', 'OP Timing', 'Call Schedule', 'Prescribing Products', 'Notes'],
+    Visits: ['Date', 'Day', 'Camp', 'Doctors (count)', 'Pharmacy (count)', 'Doctors', 'Pharmacy'],
+    Settings: ['Areas', 'Specialties', 'Camps', 'Potentials', 'Stockist', 'OP Timings', 'Call Schedule'],
+    Products: ['ProdID', 'Name', 'DosageForm'],
+  }
+  if (!required[sheetName].every((header) => headers.includes(header))) {
+    throw new Error(`Invalid ${sheetName} response from Google Sheets`)
+  }
   return rows
     .filter((row) => row.some(Boolean))
     .map((row) => Object.fromEntries(headers.map((header, index) => [header, row[index] || ''])))
@@ -73,9 +120,15 @@ async function readSheet(name, signal) {
   url.searchParams.set('tqx', 'out:csv')
   url.searchParams.set('sheet', name)
   url.searchParams.set('_', Date.now().toString())
-  const result = await fetch(url, { cache: 'no-store', signal })
-  if (!result.ok) throw new Error(`Could not read the ${name} sheet`)
-  return records(await result.text())
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const result = await fetch(url, { cache: 'no-store', signal })
+      if (!result.ok) throw new Error(`Could not read the ${name} sheet`)
+      return records(await result.text(), name)
+    } catch (error) {
+      if (signal.aborted || attempt === 1) throw error
+    }
+  }
 }
 
 function makeVisit(row, index) {
@@ -112,7 +165,7 @@ function makeVisit(row, index) {
 
 async function bootstrap(response) {
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), 10_000)
+  const timer = setTimeout(() => controller.abort(), 20_000)
   try {
     const [doctorRows, visitRows, settingRows, productRows] = await Promise.all([
       readSheet('Doctors', controller.signal),
@@ -121,6 +174,11 @@ async function bootstrap(response) {
       readSheet('Products', controller.signal),
     ])
     const serverTime = new Date().toISOString()
+    const products = productRows.filter((row) => row.ProdID && row.Name).map((row) => ({
+      prodId: row.ProdID.trim(),
+      name: row.Name.trim(),
+      dosageForm: row.DosageForm.trim(),
+    }))
     const settingColumn = (name) => unique(settingRows.map((row) => row[name]))
     const payload = {
       success: true,
@@ -137,7 +195,7 @@ async function bootstrap(response) {
         prescriber: String(row.Prescriber).trim().toLocaleLowerCase() === 'rx' ? 'Rx' : 'NRx',
         opTiming: row['OP Timing'].trim(),
         callSchedule: row['Call Schedule'].trim(),
-        prescribingProductIds: cleanList(row['Prescribing Products']),
+        prescribingProductIds: productIdsFromCell(row['Prescribing Products'], products),
         notes: row.Notes.trim(),
         updatedAt: serverTime,
         syncState: 'synced',
@@ -152,11 +210,7 @@ async function bootstrap(response) {
         opTimings: settingColumn('OP Timings'),
         callSchedules: settingColumn('Call Schedule'),
       },
-      products: productRows.filter((row) => row.ProdID && row.Name).map((row) => ({
-        prodId: row.ProdID.trim(),
-        name: row.Name.trim(),
-        dosageForm: row.DosageForm.trim(),
-      })),
+      products,
       serverTime,
     }
     response.setHeader('Cache-Control', 'no-store, max-age=0')
@@ -182,32 +236,38 @@ async function forwardWrite(request, response) {
       : JSON.stringify(request.body || {})
 
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      const upstream = await fetch(upstreamUrl, {
-        method: 'POST',
-        headers: {
-          Accept: 'application/json,text/plain,*/*',
-          'Content-Type': 'text/plain;charset=utf-8',
-          // Apps Script's content redirect intermittently returns a Google 404
-          // to server-runtime user agents. A normal browser UA avoids that path.
-          'User-Agent': 'Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 Chrome/140.0.0.0 Mobile Safari/537.36',
-        },
-        body,
-        cache: 'no-store',
-        redirect: 'follow',
-        signal: controller.signal,
-      })
-      const text = await upstream.text()
-      const contentType = upstream.headers.get('content-type') || ''
-      if (upstream.ok && contentType.includes('application/json')) {
-        response.setHeader('Cache-Control', 'no-store, max-age=0')
-        response.setHeader('Content-Type', 'application/json; charset=utf-8')
-        return response.status(200).send(text)
+      try {
+        const upstream = await fetch(upstreamUrl, {
+          method: 'POST',
+          headers: {
+            Accept: 'application/json,text/plain,*/*',
+            'Content-Type': 'text/plain;charset=utf-8',
+            // Google content redirects can fail even after a successful write.
+            // Reuse the operation ID on every retry so the write is deduplicated.
+            'User-Agent': 'Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 Chrome/140.0.0.0 Mobile Safari/537.36',
+          },
+          body,
+          cache: 'no-store',
+          redirect: 'follow',
+          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(22_000)]),
+        })
+        const text = await upstream.text()
+        const contentType = upstream.headers.get('content-type') || ''
+        if (upstream.ok && contentType.includes('application/json')) {
+          const data = JSON.parse(text)
+          if (typeof data.success !== 'boolean') throw new Error('Invalid Apps Script response')
+          response.setHeader('Cache-Control', 'no-store, max-age=0')
+          response.setHeader('Content-Type', 'application/json; charset=utf-8')
+          return response.status(200).send(text)
+        }
+      } catch (error) {
+        if (controller.signal.aborted || attempt === 1) throw error
       }
     }
 
     throw new Error('Apps Script did not accept the change')
   } catch (error) {
-    const timedOut = error instanceof Error && error.name === 'AbortError'
+    const timedOut = error instanceof Error && ['AbortError', 'TimeoutError'].includes(error.name)
     return response.status(timedOut ? 504 : 502).json({
       success: false,
       message: timedOut

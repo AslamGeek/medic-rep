@@ -21,3 +21,33 @@ The setup is non-destructive. A blank `Sheet1` is reused as `Doctors`; only the 
 
 After migration, editing or pasting product rows in the `Products` tab automatically
 assigns any missing or invalid IDs in the same `PROD-###` format.
+
+## Prescribing products storage
+
+New and edited doctors store `Name (DosageForm)` in **Prescribing Products**,
+with multiple products separated by commas in the same cell. A product without
+a dosage form stores its name alone.
+The app still uses product IDs internally for selection and validation. Both
+read paths accept existing ID cells and the readable labels.
+
+To activate this change, deploy the updated `api/sync.js` to Vercel, then replace
+the Apps Script `Code.gs` and update its existing web-app deployment to a new
+version. Existing doctor rows are converted when saved again; no bulk migration
+is required.
+
+## Sync reliability update
+
+Deploy the matching Vercel frontend/API and this Apps Script version together.
+The frontend sends queued changes immediately, independently of refreshing, and
+automatically retries transient failures. The API retries failed connections and
+invalid Google responses while retaining the same operation ID.
+
+This Apps Script version checks operation receipts and performs writes under one
+lock. If the Google response is lost after creating a doctor, a retry returns the
+assigned doctor ID instead of just a duplicate flag. Master data and doctor rows
+are read in batches to reduce service calls. Existing queued changes are preserved.
+
+Validate deployment by renaming a known test doctor, checking its Sheets row and
+the **Saved to Sheets** indicator, then editing the name in Sheets and tapping
+refresh. Measure end-to-end write time on the deployed app; local regression tests
+do not establish a production latency guarantee.

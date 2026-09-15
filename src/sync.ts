@@ -17,12 +17,37 @@ export type SyncPhase = 'offline' | 'idle' | 'syncing' | 'error'
 
 export interface SyncDetail {
   phase: SyncPhase
+  activity?: 'saving' | 'refreshing'
   message?: string
   pending?: number
 }
 
 const SYNC_EVENT = 'medrep:sync-status'
 let activeSync: Promise<void> | null = null
+let activeWrites: Promise<void> | null = null
+let retryTimer: number | undefined
+let retryDelay = 2_000
+let writeRequested = false
+let refreshing = false
+let writeError = ''
+let readError = ''
+let revision = 0
+const doctorChanges = new Map<string, number>()
+
+async function report(): Promise<void> {
+  const pending = await db.queue.count()
+  const message = writeError || readError
+  emit({
+    phase: !navigator.onLine ? 'offline' : activeWrites || refreshing ? 'syncing' : message ? 'error' : 'idle',
+    activity: activeWrites ? 'saving' : refreshing ? 'refreshing' : undefined,
+    message: message || (pending ? 'Waiting to save to Sheets' : 'Saved to Sheets'),
+    pending,
+  })
+}
+
+function changedDoctor(id: string): void {
+  doctorChanges.set(id, ++revision)
+}
 
 function emit(detail: SyncDetail): void {
   window.dispatchEvent(new CustomEvent<SyncDetail>(SYNC_EVENT, { detail }))
@@ -112,6 +137,9 @@ async function postOperation(item: QueueItem): Promise<Record<string, unknown>> 
   if (data.success !== true) {
     throw new Error(String(data.message || 'A queued change could not be saved'))
   }
+  if (item.action === 'upsertDoctor' && typeof (data.doctor as Doctor | undefined)?.id !== 'string') {
+    throw new Error('Sheets has not confirmed this doctor yet. The save will retry.')
+  }
   return data
 }
 
@@ -121,38 +149,84 @@ export async function queueChange(
   payload: QueueItem['payload'],
 ): Promise<string> {
   const opId = crypto.randomUUID()
-  await db.queue.add({
-    opId,
-    action,
-    entityId,
-    payload,
-    createdAt: new Date().toISOString(),
-    attempts: 0,
+  await db.transaction('rw', db.queue, db.doctors, db.visits, async () => {
+    if (action === 'upsertDoctor') await db.doctors.put({ ...payload as Doctor, syncState: 'pending' })
+    if (action === 'saveVisit') await db.visits.put({ ...payload as Visit, syncState: 'pending' })
+    if (action === 'undoVisit') await db.visits.delete(entityId)
+    await db.queue.add({ opId, action, entityId, payload, createdAt: new Date().toISOString(), attempts: 0 })
   })
-  emit({ phase: navigator.onLine ? 'idle' : 'offline', pending: await db.queue.count() })
+  if (action === 'upsertDoctor') changedDoctor(entityId)
+  else revision += 1
+  writeRequested = true
+  void flushChanges()
   return opId
 }
 
 async function pushQueue(): Promise<void> {
-  const items = await db.queue.orderBy('createdAt').toArray()
+  const items = await db.queue.orderBy('id').toArray()
   const failures: string[] = []
-  for (const item of items) {
+  const blockedEntities = new Set<string>()
+  for (const queued of items) {
+    const item = queued.id === undefined ? undefined : await db.queue.get(queued.id)
+    if (!item || blockedEntities.has(item.entityId)) continue
     try {
+      if (item.action === 'saveVisit') {
+        const visit = item.payload as Visit
+        const pendingDoctors = await db.queue.where('action').equals('upsertDoctor').toArray()
+        if (pendingDoctors.some((next) => visit.doctorIds.includes(next.entityId))) {
+          throw new Error('Waiting for the selected doctors to finish saving before sending this visit.')
+        }
+      }
       const result = await postOperation(item)
       await db.transaction('rw', db.queue, db.doctors, db.visits, async () => {
         if (item.action === 'upsertDoctor') {
-          const doctor = (result.doctor as Doctor | undefined) ?? (item.payload as Doctor)
-          await db.doctors.put({ ...doctor, syncState: 'synced' })
+          const doctor = result.doctor as Doctor
+          const successors = (await db.queue.where('entityId').equals(item.entityId).toArray())
+            .filter((next) => next.id !== item.id && next.action === 'upsertDoctor')
+          const latest = await db.doctors.get(item.entityId)
+          await db.doctors.put({
+            ...(successors.length && latest ? latest : doctor),
+            id: doctor.id, isNewRecord: false,
+            syncState: successors.length ? 'pending' : 'synced',
+          })
+          for (const next of successors) {
+            await db.queue.update(next.id!, {
+              entityId: doctor.id,
+              payload: { ...next.payload as Doctor, id: doctor.id, isNewRecord: false },
+            })
+          }
+          // A new doctor can be selected for a visit before Sheets assigns its ID.
+          if (doctor.id !== item.entityId) {
+            for (const next of await db.queue.where('action').equals('saveVisit').toArray()) {
+              const visit = next.payload as Visit
+              if (visit.doctorIds.includes(item.entityId)) {
+                const doctorIds = visit.doctorIds.map((id) => id === item.entityId ? doctor.id : id)
+                await db.queue.update(next.id!, { payload: { ...visit, doctorIds } })
+                await db.visits.update(visit.localId, { doctorIds })
+              }
+            }
+          }
           if (doctor.id !== item.entityId) await db.doctors.delete(item.entityId)
+          changedDoctor(item.entityId)
+          changedDoctor(doctor.id)
         }
         if (item.action === 'saveVisit') {
           const visit = item.payload as Visit
           const current = await db.visits.get(visit.localId)
-          if (current) await db.visits.put({ ...current, syncState: 'synced' })
+          if (current) await db.visits.put({ ...current, ...(result.visit as Visit | undefined), localId: current.localId, syncState: 'synced' })
+          // Undo must target the canonical row actually written by Sheets.
+          if (result.visit) {
+            for (const undo of await db.queue.where('entityId').equals(item.entityId).toArray()) {
+              if (undo.action === 'undoVisit') await db.queue.update(undo.id!, { payload: { visit: result.visit as Visit } })
+            }
+          }
+          revision += 1
         }
+        if (item.action === 'undoVisit') revision += 1
         if (item.id !== undefined) await db.queue.delete(item.id)
       })
     } catch (error) {
+      blockedEntities.add(item.entityId)
       if (item.id !== undefined) {
         await db.queue.update(item.id, { attempts: item.attempts + 1 })
       }
@@ -168,23 +242,26 @@ async function pushQueue(): Promise<void> {
   }
 }
 
-async function applyBootstrap(payload: BootstrapPayload): Promise<void> {
-  const pendingDoctorIds = new Set(
-    (await db.queue.where('action').equals('upsertDoctor').toArray()).map(
-      (item) => item.entityId,
-    ),
-  )
-  const pendingVisitIds = new Set(
-    (await db.queue.where('action').equals('saveVisit').toArray()).map(
-      (item) => item.entityId,
-    ),
-  )
+async function applyBootstrap(payload: BootstrapPayload, startedAt: number): Promise<void> {
+  await db.transaction('rw', db.queue, db.doctors, db.visits, db.meta, async () => {
+    const pendingDoctorIds = new Set(
+      (await db.queue.where('action').equals('upsertDoctor').toArray()).map(
+        (item) => item.entityId,
+      ),
+    )
+    for (const [id, changedAt] of doctorChanges) {
+      if (changedAt > startedAt) pendingDoctorIds.add(id)
+    }
+    const pendingVisitIds = new Set(
+      (await db.queue.where('action').equals('saveVisit').toArray()).map(
+        (item) => item.entityId,
+      ),
+    )
 
-  await db.transaction('rw', db.doctors, db.visits, db.meta, async () => {
     await db.doctors
       .filter((doctor) => doctor.syncState === 'synced' && !pendingDoctorIds.has(doctor.id))
       .delete()
-    await db.visits
+    if (revision === startedAt) await db.visits
       .filter((visit) => visit.syncState === 'synced' && !pendingVisitIds.has(visit.localId))
       .delete()
 
@@ -195,7 +272,7 @@ async function applyBootstrap(payload: BootstrapPayload): Promise<void> {
           .map((doctor) => ({ ...doctor, syncState: 'synced' as const })),
       )
     }
-    if (payload.visits.length) {
+    if (revision === startedAt && payload.visits.length) {
       await db.visits.bulkPut(
         payload.visits
           .filter((visit) => !pendingVisitIds.has(visit.localId))
@@ -213,27 +290,49 @@ async function applyBootstrap(payload: BootstrapPayload): Promise<void> {
 }
 
 async function performSync(): Promise<void> {
-  emit({ phase: 'syncing', pending: await db.queue.count() })
+  // Flush existing changes first, but new saves run independently of this read.
+  await flushChanges()
+  if (!navigator.onLine) return
+  refreshing = true
+  readError = ''
+  await report()
   try {
+    const startedAt = revision
     const bootstrap = await getBootstrap()
-    await applyBootstrap(bootstrap)
+    await applyBootstrap(bootstrap, startedAt)
     await setMeta('lastSuccessfulSync', new Date().toISOString())
-    const pending = await db.queue.count()
-    emit({ phase: 'idle', message: 'Sheet data updated', pending })
-
-    try {
-      await pushQueue()
-      emit({ phase: 'idle', pending: await db.queue.count() })
-    } catch (error) {
-      const message = error instanceof Error
-        ? `Sheet data updated. A local change is still pending: ${error.message}`
-        : 'Sheet data updated. A local change is still pending.'
-      emit({ phase: 'error', message, pending: await db.queue.count() })
-    }
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Sync is temporarily unavailable'
-    emit({ phase: 'error', message, pending: await db.queue.count() })
+    readError = error instanceof Error ? error.message : 'Could not refresh from Sheets'
+  } finally {
+    refreshing = false
+    await report()
   }
+}
+
+export function flushChanges(): Promise<void> {
+  if (activeWrites) return activeWrites
+  if (retryTimer !== undefined) window.clearTimeout(retryTimer)
+  retryTimer = undefined
+  if (!navigator.onLine) return report()
+  activeWrites = (async () => {
+    writeError = ''
+    await report()
+    do {
+      writeRequested = false
+      await pushQueue()
+    } while (writeRequested)
+    retryDelay = 2_000
+  })().catch((error: unknown) => {
+    writeError = error instanceof Error ? error.message : 'Could not save to Sheets'
+  }).finally(async () => {
+    activeWrites = null
+    await report()
+    if (await db.queue.count() && navigator.onLine) {
+      retryTimer = window.setTimeout(() => { void flushChanges() }, retryDelay)
+      retryDelay = Math.min(retryDelay * 2, 30_000)
+    }
+  })
+  return activeWrites
 }
 
 export function syncNow(): Promise<void> {
