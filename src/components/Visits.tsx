@@ -230,7 +230,7 @@ export function Visits({ doctors, visits, settings, defaultCamp, focusDoctorId, 
   )
   const [query, setQuery] = useState('')
   const [specialty, setSpecialty] = useState('')
-  const [callSchedule, setCallSchedule] = useState('Everyday')
+  const [callSchedule, setCallSchedule] = useState(initialDoctor?.callSchedule || 'Everyday')
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
 

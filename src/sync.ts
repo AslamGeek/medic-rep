@@ -160,11 +160,15 @@ async function postOperation(item: QueueItem): Promise<Record<string, unknown>> 
   }, WRITE_TIMEOUT_MS)
   if (data.success !== true) {
     const message = String(data.message || 'A queued change could not be saved')
-    if (/must come from the spreadsheet master list/.test(message)) throw new ValidationError(message)
+    if (/must come from the spreadsheet master list|^Availability:|Missing DoctorAvailability sheet/.test(message)) throw new ValidationError(message)
     throw new Error(message)
   }
   if (item.action === 'upsertDoctor' && typeof (data.doctor as Doctor | undefined)?.id !== 'string') {
     throw new Error('Sheets has not confirmed this doctor yet. The save will retry.')
+  }
+  if (item.action === 'upsertDoctor' && (payload as Doctor).availability !== undefined
+    && !Array.isArray((data.doctor as Doctor | undefined)?.availability)) {
+    throw new ValidationError('Availability: update Apps Script and run setupSpreadsheet, then refresh to retry these call windows.')
   }
   return data
 }

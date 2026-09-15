@@ -2,6 +2,13 @@ export type Prescriber = 'Rx' | 'NRx'
 
 export type SyncState = 'pending' | 'synced' | 'error'
 
+export interface CallWindow {
+  days: string[]
+  from: string
+  until: string
+  notes: string
+}
+
 export interface Doctor {
   id: string
   isNewRecord?: boolean
@@ -15,6 +22,7 @@ export interface Doctor {
   stockist: string
   prescriber: Prescriber
   opTiming: string
+  availability?: CallWindow[]
   callSchedule: string
   prescribingProductIds: string[]
   notes: string

@@ -19,12 +19,19 @@ function sheet(rows) {
     getLastRow: () => rows.length,
     getLastColumn: () => rows[0].length,
     appendRow: (row) => rows.push(row),
+    deleteRow: (row) => rows.splice(row - 1, 1),
+    setFrozenRows() {},
     getDataRange() { return this.getRange(1, 1, rows.length, rows[0].length) },
     getRange: (row, column, height = 1, width = 1) => ({
       getValues: () => rows.slice(row - 1, row - 1 + height)
         .map((cells) => cells.slice(column - 1, column - 1 + width)),
       getDisplayValues() { return this.getValues() },
+      getValue() { return this.getValues()[0]?.[0] || '' },
+      setFontWeight() { return this },
+      setBackground() { return this },
+      setFontColor() { return this },
       setValues: (values) => values.forEach((cells, index) => {
+        rows[row - 1 + index] ||= []
         rows[row - 1 + index].splice(column - 1, width, ...cells)
       }),
       sort: (specs) => {
@@ -62,6 +69,7 @@ function fixture() {
     Settings: sheet([Array.from(context.SHEET_HEADERS.Settings),
       ['Town', 'General', 'Proddatur', '', '', '', '']]),
     Visits: sheet([Array.from(context.SHEET_HEADERS.Visits)]),
+    DoctorAvailability: sheet([Array.from(context.SHEET_HEADERS.DoctorAvailability)]),
   }
   context.ACTIVE_SPREADSHEET_ = { getSheetByName: (name) => sheets[name] }
   const input = {
@@ -217,4 +225,58 @@ test('equivalent forms with more than one matching master row are not guessed', 
   const products = context.getProducts_()
   assert.deepEqual(Array.from(context.productIdsFromCell_('API-TOP (Syrup)', products)), ['API-TOP (Syrup)'])
   assert.deepEqual(Array.from(context.productIdsFromCell_('PROD-007', products)), ['PROD-007'])
+})
+
+test('call windows round-trip through GAS and CSV, update without touching other doctors, and survive old clients', async (t) => {
+  const { context, sheets, input } = fixture()
+  const windows = [{ days: ['Tue', 'Fri'], from: '10:00', until: '11:00', notes: 'Morning calls' },
+    { days: ['Mon'], from: '14:00', until: '', notes: 'Confirm closing time' }]
+  const created = context.upsertDoctor_({ ...input, availability: windows }).doctor
+  const second = context.upsertDoctor_({ ...input, name: 'Another Doctor', availability: [windows[1]] }).doctor
+  assert.deepEqual(JSON.parse(JSON.stringify(context.getDoctors_()[0].availability)), windows)
+  t.mock.method(globalThis, 'fetch', async url => ({ ok: true, text: async () =>
+    sheets[new URL(url).searchParams.get('sheet')].rows.map(row => row.map(value => `"${String(value).replaceAll('"', '""')}"`).join(',')).join('\n') }))
+  let payload
+  await handler({ method: 'GET' }, { setHeader() {}, status(code) { assert.equal(code, 200); return this }, json(value) { payload = value } })
+  assert.deepEqual(payload.doctors.find(doctor => doctor.id === created.id).availability, windows)
+  const request = { postData: { contents: JSON.stringify({ action: 'upsertDoctor', opId: 'windows-op', payload: { ...created, availability: [windows[0]] } }) } }
+  assert.equal(context.doPost(request).success, true)
+  const retried = context.doPost(request)
+  assert.equal(retried.success, true)
+  assert.equal(retried.doctor.availability.length, 1)
+  assert.equal(sheets.DoctorAvailability.rows.length, 3)
+  const { availability: _unused, ...oldClient } = JSON.parse(JSON.stringify(created))
+  context.upsertDoctor_({ ...oldClient, notes: 'Old client edit' })
+  assert.equal(context.getDoctors_().find(doctor => doctor.id === created.id).availability.length, 1)
+  context.upsertDoctor_({ ...created, availability: [] })
+  assert.equal(context.getDoctors_().find(doctor => doctor.id === created.id).availability.length, 0)
+  assert.equal(context.getDoctors_().find(doctor => doctor.id === second.id).availability.length, 1)
+})
+
+test('invalid or unconfigured availability is rejected before any sheet write', () => {
+  const { context, sheets, input } = fixture()
+  assert.throws(() => context.upsertDoctor_({ ...input, availability: [{ days: ['Tue'], from: '14:00', until: '13:00' }] }), /Availability:/)
+  assert.equal(sheets.Doctors.rows.length, 1)
+  assert.equal(sheets.DoctorAvailability.rows.length, 1)
+  delete sheets.DoctorAvailability
+  assert.throws(() => context.upsertDoctor_({ ...input, availability: [] }), /Run setupSpreadsheet/)
+  assert.equal(sheets.Doctors.rows.length, 1)
+})
+
+test('Apps Script availability helpers match the shared source exactly', () => {
+  const gas = readFileSync(new URL('../gas/Code.gs', import.meta.url), 'utf8').replaceAll('\r\n', '\n')
+  const shared = readFileSync(new URL('../shared/availability.js', import.meta.url), 'utf8').replaceAll('\r\n', '\n').replace(/^export \{.*\}\n?/m, '')
+  assert.equal(gas.split('// BEGIN SHARED AVAILABILITY (shared/availability.js)\n')[1].split('// END SHARED AVAILABILITY')[0], shared)
+})
+
+test('setup adds DoctorAvailability without changing existing records and can run again', () => {
+  const { context, sheets, input } = fixture()
+  context.upsertDoctor_(input)
+  delete sheets.DoctorAvailability
+  const before = Object.fromEntries(Object.entries(sheets).map(([name, value]) => [name, JSON.stringify(value.rows)]))
+  context.ACTIVE_SPREADSHEET_.insertSheet = name => sheets[name] = sheet([['']])
+  context.setupSpreadsheet()
+  context.setupSpreadsheet()
+  assert.deepEqual(Array.from(sheets.DoctorAvailability.rows[0]), ['Doctor ID', 'Days', 'From', 'Until', 'Notes'])
+  for (const [name, rows] of Object.entries(before)) assert.equal(JSON.stringify(sheets[name].rows), rows)
 })

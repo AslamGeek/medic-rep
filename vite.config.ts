@@ -3,7 +3,7 @@ import { defineConfig } from 'vite'
 import { VitePWA } from 'vite-plugin-pwa'
 
 const gasWebAppUrl = new URL(
-  'https://script.google.com/macros/s/AKfycbwfIkuC5YNNNb2KykmVsCQiD9PDwmHKUmIwOhItV6xvlOp7RvgVPOgOC6xNN-eEuAc4/exec',
+  'https://script.google.com/macros/s/AKfycbxGzHJ5gF_TwPijKu8vzsfEu6wYMnUUqS_1XxLdfs7UmkW-CvOVFDyZGYL2pC-XqNi7/exec',
 )
 
 const syncProxy = {

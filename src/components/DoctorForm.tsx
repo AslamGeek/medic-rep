@@ -11,7 +11,8 @@ import {
   Stethoscope,
   X,
 } from 'lucide-react'
-import type { Doctor, MasterData, Prescriber } from '../types'
+import type { CallWindow, Doctor, MasterData, Prescriber } from '../types'
+import { WEEKDAYS, validateAvailability } from '../../shared/availability.js'
 import { generateDoctorId, normalize, productLabel } from '../utils'
 import { productIdsFromCell, unresolvedProductReferences } from '../../shared/products.js'
 
@@ -75,6 +76,10 @@ export function DoctorForm({ doctor, doctors, master, onClose, onSave }: DoctorF
   const [error, setError] = useState('')
   const [saving, setSaving] = useState(false)
 
+  const updateWindow = (index: number, changes: Partial<CallWindow>) => {
+    set('availability', (form.availability || []).map((window, position) => position === index ? { ...window, ...changes } : window))
+  }
+
   const set = <K extends keyof Doctor>(key: K, value: Doctor[K]) => {
     setForm((current) => ({ ...current, [key]: value }))
   }
@@ -92,6 +97,12 @@ export function DoctorForm({ doctor, doctors, master, onClose, onSave }: DoctorF
     setError('')
     if (!form.name.trim() || !form.area || !form.camp) {
       setError('Name, area and camp are required.')
+      return
+    }
+    try {
+      if (form.availability !== undefined) validateAvailability(form.availability)
+    } catch (availabilityError) {
+      setError(availabilityError instanceof Error ? availabilityError.message : 'Review call availability.')
       return
     }
     const duplicate = doctors.find(
@@ -264,6 +275,28 @@ export function DoctorForm({ doctor, doctors, master, onClose, onSave }: DoctorF
             <MasterSelect label="OP timing" value={form.opTiming} values={master.settings.opTimings} onChange={(value) => set('opTiming', value)} />
             <MasterSelect label="Call schedule" value={form.callSchedule} values={master.settings.callSchedules} onChange={(value) => set('callSchedule', value)} />
           </div>
+          <p className="muted-inline">Set when the doctor accepts representative calls. These windows take priority over the general OP timing in Visit now.</p>
+          {(form.availability || []).map((window, index) => (
+            <fieldset className="call-window" key={index}>
+              <legend>Call window {index + 1}</legend>
+              <div className="chip-row" role="group" aria-label={`Weekdays for window ${index + 1}`}>
+                {[...WEEKDAYS.slice(1), WEEKDAYS[0]].map(day => (
+                  <button type="button" key={day} className={`choice-chip ${window.days.includes(day) ? 'selected' : ''}`}
+                    aria-pressed={window.days.includes(day)}
+                    onClick={() => updateWindow(index, { days: window.days.includes(day) ? window.days.filter(value => value !== day) : [...window.days, day] })}>{day}</button>
+                ))}
+              </div>
+              <div className="two-column-fields">
+                <label className="field"><span>Available from</span><input aria-label={`Available from, window ${index + 1}`} type="time" required value={window.from} onChange={event => updateWindow(index, { from: event.target.value })} /></label>
+                <label className="field"><span>Available until</span><input aria-label={`Available until, window ${index + 1}`} type="time" value={window.until} onChange={event => updateWindow(index, { until: event.target.value })} /></label>
+              </div>
+              <p className="muted-inline">Leave the end blank only if the closing time is unknown. Use separate windows for different days or morning/evening calls.</p>
+              <label className="field"><span>Timing note</span><input aria-label={`Timing note, window ${index + 1}`} value={window.notes} maxLength={200} placeholder="For example: meet after the last patient" onChange={event => updateWindow(index, { notes: event.target.value })} /></label>
+              <button type="button" className="choice-chip" aria-label={`Remove window ${index + 1}`} onClick={() => set('availability', (form.availability || []).filter((_, position) => position !== index))}>Remove window</button>
+            </fieldset>
+          ))}
+          <button type="button" className="choice-chip" disabled={(form.availability || []).length >= 14}
+            onClick={() => set('availability', [...(form.availability || []), { days: [...WEEKDAYS], from: '', until: '', notes: '' }])}>Add call window</button>
         </section>
 
         <section className="form-card">

@@ -10,6 +10,7 @@ import {
   Store,
 } from 'lucide-react'
 import type { Doctor, Product, Visit } from '../types'
+import { timeLabel } from '../planning'
 import {
   buildLastVisitMap,
   doctorProductNames,
@@ -57,6 +58,14 @@ export function DoctorDetail({ doctor, products, visits, onClose, onEdit, onLogV
       </header>
 
       <main className="detail-content">
+        {!!doctor.availability?.length && <section className="detail-card">
+          <h3>Call availability</h3>
+          {doctor.availability.map((window, index) => <p className="planner-window" key={index}>
+            {window.days.join(', ')} · {window.from ? timeLabel(window.from) : 'Start unknown'}
+            {window.until ? `–${timeLabel(window.until)}` : ' onwards · closing time unknown'}
+            {window.notes && ` · ${window.notes}`}
+          </p>)}
+        </section>}
         <section className={`profile-hero ${doctor.prescriber === 'Rx' ? 'rx' : ''}`}>
           <div className="avatar">{doctor.name.trim().charAt(0).toUpperCase() || 'D'}</div>
           <div className="profile-copy">

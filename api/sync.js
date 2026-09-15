@@ -1,9 +1,10 @@
 import { createHash } from 'node:crypto'
 import { productIdsFromCell } from '../shared/products.js'
+import { availabilityFromRecords } from '../shared/availability.js'
 
 const SPREADSHEET_ID = '1Zg5Rxn6TNskev1EFwwrZI9gWP1mDyifBg6ACI_YTFxU'
 const DEFAULT_GAS_WEB_APP_URL =
-  'https://script.google.com/macros/s/AKfycbwfIkuC5YNNNb2KykmVsCQiD9PDwmHKUmIwOhItV6xvlOp7RvgVPOgOC6xNN-eEuAc4/exec'
+  'https://script.google.com/macros/s/AKfycbxGzHJ5gF_TwPijKu8vzsfEu6wYMnUUqS_1XxLdfs7UmkW-CvOVFDyZGYL2pC-XqNi7/exec'
 
 function parseCsv(text) {
   const rows = []
@@ -69,6 +70,7 @@ function records(csv, sheetName) {
     Visits: ['Date', 'Day', 'Camp', 'Doctors (count)', 'Pharmacy (count)', 'Doctors', 'Pharmacy'],
     Settings: ['Areas', 'Specialties', 'Camps', 'Potentials', 'Stockist', 'OP Timings', 'Call Schedule'],
     Products: ['ProdID', 'Name', 'DosageForm'],
+    DoctorAvailability: ['Doctor ID', 'Days', 'From', 'Until', 'Notes'],
   }
   if (!required[sheetName].every((header) => headers.includes(header))) {
     throw new Error(`Invalid ${sheetName} response from Google Sheets`)
@@ -130,12 +132,14 @@ async function bootstrap(response) {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), 20_000)
   try {
-    const [doctorRows, visitRows, settingRows, productRows] = await Promise.all([
+    const [doctorRows, visitRows, settingRows, productRows, availabilityRows] = await Promise.all([
       readSheet('Doctors', controller.signal),
       readSheet('Visits', controller.signal),
       readSheet('Settings', controller.signal),
       readSheet('Products', controller.signal),
+      readSheet('DoctorAvailability', controller.signal),
     ])
+    const availability = availabilityFromRecords(availabilityRows)
     const serverTime = new Date().toISOString()
     const products = productRows.filter((row) => row.ProdID && row.Name).map((row) => ({
       prodId: row.ProdID.trim(),
@@ -157,6 +161,7 @@ async function bootstrap(response) {
         stockist: row.Stockist.trim(),
         prescriber: String(row.Prescriber).trim().toLocaleLowerCase() === 'rx' ? 'Rx' : 'NRx',
         opTiming: row['OP Timing'].trim(),
+        availability: availability[row.ID.trim()] || [],
         callSchedule: row['Call Schedule'].trim(),
         prescribingProductIds: productIdsFromCell(row['Prescribing Products'], products),
         notes: row.Notes.trim(),
@@ -182,7 +187,10 @@ async function bootstrap(response) {
     const timedOut = error instanceof Error && error.name === 'AbortError'
     return response.status(timedOut ? 504 : 502).json({
       success: false,
-      message: timedOut ? 'Google Sheets took too long to respond' : 'Could not read Google Sheets',
+      message: timedOut ? 'Google Sheets took too long to respond'
+        : String(error?.message || '').includes('DoctorAvailability')
+          ? 'Could not read DoctorAvailability. Run setupSpreadsheet in the updated Apps Script, then refresh. If the tab already exists, check its headers and retry.'
+          : 'Could not read Google Sheets',
     })
   } finally {
     clearTimeout(timer)

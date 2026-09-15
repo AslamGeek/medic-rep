@@ -81,6 +81,18 @@ test('a failed refresh does not prevent an already queued doctor save', async ()
   assert.equal(await db.queue.count(), 0)
 })
 
+test('an older Apps Script response cannot silently acknowledge unsaved call windows', async () => {
+  const pendingDoctor = { ...doctor, availability: [{ days: ['Tue'], from: '10:00', until: '11:00', notes: '' }] }
+  const { db, sync } = setup(async () => response({ success: true, doctor }))
+  await db.doctors.put(pendingDoctor)
+  await db.queue.add({ opId: 'windows-old-deployment', action: 'upsertDoctor', entityId: doctor.id,
+    payload: pendingDoctor, attempts: 0, createdAt: '1' })
+  await sync.flushChanges()
+  assert.equal(await db.queue.count(), 1)
+  assert.match((await db.queue.toArray())[0].validationError, /update Apps Script/)
+  assert.deepEqual((await db.doctors.get(doctor.id)).availability, pendingDoctor.availability)
+})
+
 test('an edit sends immediately even while refresh is waiting for Sheets', async () => {
   const read = deferred()
   const calls = []

@@ -1,12 +1,34 @@
 # Google Apps Script setup
 
+## Visit now update — required setup
+
+1. Replace the Apps Script project's `Code.gs` with this version.
+2. Run **setupSpreadsheet** once. It adds the new **DoctorAvailability** tab;
+   existing doctor, visit, product, and settings rows are preserved.
+3. **Deploy → Manage deployments → Edit → New version → Deploy**, retaining
+   the existing deployment URL.
+4. Push/deploy the matching app to Vercel and reopen it.
+
+Add weekdays and start/end times using **Edit doctor → Availability → Add call
+window**. The app stores each window as a separate DoctorAvailability row, keyed
+by doctor ID. `Days` contains comma-separated weekday names, `From` and `Until`
+use `HH:mm`, and `Notes` is optional. An empty Until means the closing time is
+unknown. Multiple rows support different days and morning/evening windows.
+Direct Sheet edits are retrieved on refresh. Custom card orders are stored per
+camp on each device and do not change Sheet row order.
+
+Deploy Apps Script and create the tab **before** deploying the frontend/API.
+Old clients that omit availability do not delete existing call windows.
+
+## Existing connection
+
 The app is already configured for spreadsheet:
 
 `1Zg5Rxn6TNskev1EFwwrZI9gWP1mDyifBg6ACI_YTFxU`
 
 The current web-app deployment is:
 
-`https://script.google.com/macros/s/AKfycbwfIkuC5YNNNb2KykmVsCQiD9PDwmHKUmIwOhItV6xvlOp7RvgVPOgOC6xNN-eEuAc4/exec`
+`https://script.google.com/macros/s/AKfycbxGzHJ5gF_TwPijKu8vzsfEu6wYMnUUqS_1XxLdfs7UmkW-CvOVFDyZGYL2pC-XqNi7/exec`
 
 1. Open the Apps Script project used for the web-app URL.
 2. Replace its `Code.gs` with the included `Code.gs`.

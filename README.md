@@ -17,6 +17,9 @@ A mobile-first, installable Progressive Web App for a single medical representat
 - Visit history and monthly calendar
 - Light/dark mode and installable offline app shell
 - Legacy doctor-header adapter without rewriting existing rows
+- Visit now: actual local weekday/time, call windows, camp/call schedule/OP timing filters
+- Availability order and persistent manual card order for each camp on this device
+- Weekday-specific representative call windows, stored in DoctorAvailability
 
 ## Data flow
 
@@ -45,12 +48,63 @@ Master-list validation failures pause automatic retries. Correcting and saving t
 doctor replaces its rejected edit; refreshing retries it against the current master
 list. Temporary connection failures continue to retry automatically.
 
-The spreadsheet is human-readable and contains only:
+The spreadsheet uses these human-readable tabs:
 
 - `Doctors`
 - `Visits`
 - `Settings`
 - `Products`
+- `DoctorAvailability`
+
+## Visit now and call windows
+
+Before deploying this feature, replace Apps Script `Code.gs`, run
+`setupSpreadsheet` once to create `DoctorAvailability`, and deploy a **new version
+of the existing web-app deployment**. Then push/deploy Vercel. Existing records
+remain intact. This setup step is required even if the other four tabs already
+exist; a failed availability read does not silently become an empty timing list.
+
+Open **Visit now** in the bottom navigation. The top camp and call schedule filters
+apply here; use Availability, OP timing, and search to narrow the cards further.
+The planner uses actual device-local time, refreshed every minute and on returning
+to the app. The date picker in Visits does not affect it.
+
+**By availability** places open windows first (earliest closing first), then
+upcoming windows. Unconfirmed timings, ended windows, and other weekdays are
+clearly labelled. **My order** preserves a separate order for every camp. Use
+the up/down arrows to customize it. Switching camps, modes, reopening, or clock
+updates preserves the custom order. New doctors join its end. Filtering and
+moving visible cards does not discard hidden doctors. OP/status/search filters
+are also remembered per camp. Orders are device preferences, like filter presets;
+they do not rearrange Sheets or sync to another device. Clearing browser data
+removes them. Doctor availability itself syncs to Sheets across devices.
+
+Use **Edit timings → Add call window** for a doctor. Select weekdays, a start time,
+an optional closing time, and an optional note. End times must be after start times
+on the same day. Multiple windows support morning/evening calls or different days.
+These windows take priority over legacy OP timing when determining availability.
+General OP timing and Call schedule remain master-list selections and filters.
+
+Without windows, exact legacy labels such as `After 11 am` and `10 am to 11 am`
+are recognized with common weekday call schedules such as `Everyday` or
+`Tue & Fri`. Unknown text remains **Timing unknown**. An omitted closing time is
+shown as unknown; once its start time passes the app asks you to confirm availability.
+
+DoctorAvailability uses one row per window:
+
+| Doctor ID | Days | From | Until | Notes |
+| --- | --- | --- | --- | --- |
+| PDTR-001 | Tue, Fri | 10:00 | 11:00 | Morning calls |
+| PDTR-001 | Mon, Wed | 14:00 | 15:00 | Afternoon clinic |
+
+Use the doctor's exact ID, comma-separated weekday names (`Mon` through `Sun`),
+and 24-hour `HH:mm` times. Recognized 12-hour displayed times also work.
+Leave Until empty only when it is unknown. Edit these rows directly in Sheets
+and refresh the app to retrieve them. Do not rename these headers.
+
+The portable parsing/validation block in `gas/Code.gs` is copied from
+`shared/availability.js` (without its export line); a regression test verifies
+they remain identical. Keep both copies updated together.
 
 Spreadsheet ID: `1Zg5Rxn6TNskev1EFwwrZI9gWP1mDyifBg6ACI_YTFxU`
 

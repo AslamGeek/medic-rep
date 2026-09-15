@@ -205,7 +205,7 @@
   left: max(14px, calc((100vw - 820px) / 2 + 14px));
   z-index: 50;
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 5px;
   padding: 6px;
   background: color-mix(in srgb, var(--surface-raised) 92%, transparent);
@@ -693,3 +693,33 @@
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
 }
+
+/* Visit now and structured call availability */
+.planner-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 18px 0 14px; }
+.planner-heading h2 { margin-top: 3px; font-size: 23px; }
+.planner-clock { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--accent-strong); }
+.planner-hint { margin: 10px 0; color: var(--muted); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.planner-filters { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.planner-list { list-style: none; padding: 0; margin: 12px 0; display: grid; gap: 12px; }
+.planner-card { min-width: 0; padding: 14px; border: 1px solid var(--border); border-left: 4px solid var(--faint); border-radius: 16px; background: var(--surface-raised); }
+.planner-card.availability-now { border-left-color: var(--accent); }
+.planner-card.availability-later { border-left-color: #cb9236; }
+.planner-card-top { display: flex; align-items: center; gap: 8px; }
+.planner-number { color: var(--muted); font-size: 12px; }
+.planner-doctor-name { flex: 1; min-width: 0; padding: 8px 0; text-align: left; background: none; border: 0; color: var(--ink); font-size: 16px; font-weight: 750; overflow-wrap: anywhere; cursor: pointer; }
+.planner-arrows { display: flex; flex-shrink: 0; gap: 3px; }
+.planner-arrows .icon-button { width: 40px; height: 44px; }
+.planner-arrows button:disabled { opacity: .3; cursor: default; }
+.planner-location { display: flex; gap: 5px; align-items: baseline; font-size: 12px; color: var(--muted); margin: 3px 0 10px; overflow-wrap: anywhere; }
+.planner-location svg { flex-shrink: 0; }
+.availability-label { display: inline-block; padding: 5px 8px; border-radius: 6px; color: var(--muted); background: var(--surface-soft); font-size: 11px; font-weight: 750; }
+.availability-now .availability-label { color: var(--accent-strong); background: var(--accent-soft); }
+.planner-window { margin: 8px 0; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+.planner-card-actions { display: flex; gap: 8px; margin-top: 12px; }
+.planner-card-actions button { min-height: 40px; }
+.call-window { margin: 14px 0; padding: 12px; border: 1px solid var(--border); border-radius: 12px; min-width: 0; }
+.call-window legend { padding: 0 5px; color: var(--ink); font-size: 13px; font-weight: 700; }
+.call-window .chip-row { margin: 5px 0 12px; }
+.call-window .choice-chip { min-height: 40px; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+@media (max-width: 360px) { .bottom-nav button { gap: 4px; font-size: 11px; } .planner-heading { align-items: flex-start; } .planner-clock { font-size: 11px; } }

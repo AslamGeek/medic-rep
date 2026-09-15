@@ -33,7 +33,8 @@ var SHEET_HEADERS = {
     'Areas', 'Specialties', 'Camps', 'Potentials', 'Stockist',
     'OP Timings', 'Call Schedule'
   ],
-  Products: ['ProdID', 'Name', 'DosageForm']
+  Products: ['ProdID', 'Name', 'DosageForm'],
+  DoctorAvailability: ['Doctor ID', 'Days', 'From', 'Until', 'Notes']
 };
 
 var HEADER_ALIASES = {
@@ -540,9 +541,42 @@ function getDoctors_(products) {
   var rows = sheet.getDataRange().getValues();
   var headers = rows.shift().map(function (value) { return String(value).trim(); });
   products = products || getProducts_();
+  var availability = getDoctorAvailability_();
   return rows
     .map(function (row) { return doctorFromRow_(headers, row, products); })
-    .filter(Boolean);
+    .filter(Boolean).map(function (doctor) {
+      doctor.availability = availability[doctor.id] || [];
+      return doctor;
+    });
+}
+
+function getDoctorAvailability_() {
+  var sheet = spreadsheet_().getSheetByName('DoctorAvailability');
+  if (!sheet) return {};
+  var rows = sheet.getDataRange().getDisplayValues();
+  var headers = rows.shift();
+  SHEET_HEADERS.DoctorAvailability.forEach(function (name) { columnIndex_(headers, name); });
+  return availabilityFromRecords(rows.map(function (row) {
+    var record = {};
+    SHEET_HEADERS.DoctorAvailability.forEach(function (name) { record[name] = valueAt_(headers, row, name); });
+    return record;
+  }));
+}
+
+function saveDoctorAvailability_(id, windows) {
+  var sheet = sheet_('DoctorAvailability');
+  var headers = readHeaders_(sheet);
+  var rows = sheet.getDataRange().getValues();
+  var idColumn = columnIndex_(headers, 'Doctor ID');
+  for (var index = rows.length - 1; index >= 1; index--) {
+    if (cleanText_(rows[index][idColumn], 120) === id) sheet.deleteRow(index + 1);
+  }
+  windows.forEach(function (window) {
+    var row = new Array(headers.length).fill('');
+    var values = { 'Doctor ID': id, Days: window.days.join(', '), From: window.from, Until: window.until, Notes: window.notes };
+    Object.keys(values).forEach(function (key) { row[columnIndex_(headers, key)] = values[key]; });
+    sheet.appendRow(row);
+  });
 }
 
 function validateChoice_(label, value, allowed, optional) {
@@ -584,6 +618,7 @@ function validateDoctor_(input, products) {
   };
 
   if (!doctor.id || !doctor.name) throw new Error('Doctor ID and name are required.');
+  if (input.availability !== undefined) doctor.availability = validateAvailability(input.availability);
   return doctor;
 }
 
@@ -641,6 +676,10 @@ function upsertDoctor_(input, lockHeld) {
   if (!lockHeld) lock.waitLock(20000);
   try {
     var sheet = sheet_('Doctors');
+    if (doctor.availability !== undefined) {
+      var availabilityHeaders = readHeaders_(sheet_('DoctorAvailability'));
+      SHEET_HEADERS.DoctorAvailability.forEach(function (name) { columnIndex_(availabilityHeaders, name); });
+    }
     var rows = sheet.getDataRange().getValues();
     var headers = rows.shift().map(function (value) { return String(value).trim(); });
     var idIndex = columnIndex_(headers, 'ID');
@@ -670,6 +709,10 @@ function upsertDoctor_(input, lockHeld) {
       existingRow[columnIndex_(headers, canonical)] = doctorCellValue_(doctor, canonical, products);
     });
 
+    // Write windows first: a retried creation reuses the same next ID until the
+    // doctor row is committed. Old clients omit this field and retain windows.
+    if (doctor.availability !== undefined) saveDoctorAvailability_(doctor.id, doctor.availability);
+    else doctor.availability = getDoctorAvailability_()[doctor.id] || [];
     if (rowNumber > 0) {
       sheet.getRange(rowNumber, 1, 1, headers.length).setValues([existingRow]);
     } else {
@@ -876,3 +919,60 @@ function rememberOperation_(opId, result) {
     JSON.stringify(operations)
   );
 }
+
+// BEGIN SHARED AVAILABILITY (shared/availability.js)
+// Keep the portable helpers in sync with the marked block in gas/Code.gs.
+const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+
+function parseDays(value) {
+  const text = String(value || '').trim().toLowerCase()
+  if (/^(everyday|every day|daily|all days)$/.test(text)) return [...WEEKDAYS]
+  const tokens = text.split(/\s*(?:,|&|\/|\band\b)\s*/).filter(Boolean)
+  const names = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday']
+  const days = tokens.map(token => WEEKDAYS.find((day, index) => token === day.toLowerCase() || token === names[index]))
+  return days.length && days.every(Boolean) ? [...new Set(days)] : []
+}
+
+function parseClock(value) {
+  const text = String(value || '').trim().toLowerCase().replace(/\./g, '')
+  const match = text.match(/^(\d{1,2})(?::(\d{2}))?(?::00)?\s*(am|pm)?$/)
+  if (!match) return ''
+  let hour = Number(match[1])
+  const minute = Number(match[2] || 0)
+  if (minute > 59 || (match[3] ? hour < 1 || hour > 12 : hour > 23)) return ''
+  if (match[3]) hour = hour % 12 + (match[3] === 'pm' ? 12 : 0)
+  return String(hour).padStart(2, '0') + ':' + String(minute).padStart(2, '0')
+}
+
+function validateAvailability(windows) {
+  if (!Array.isArray(windows) || windows.length > 14) throw new Error('Availability: use up to 14 time windows.')
+  return windows.map(window => {
+    if (!window || !Array.isArray(window.days) || !window.days.length || window.days.some(day => !WEEKDAYS.includes(day))) {
+      throw new Error('Availability: select at least one valid weekday for each window.')
+    }
+    if (!/^\d{2}:\d{2}$/.test(window.from || '') || parseClock(window.from) !== window.from) {
+      throw new Error('Availability: enter a valid start time for each window.')
+    }
+    const until = window.until || ''
+    if (until && (!/^\d{2}:\d{2}$/.test(until) || parseClock(until) !== until || until <= window.from)) {
+      throw new Error('Availability: closing time must be after start time on the same day.')
+    }
+    return { days: WEEKDAYS.filter(day => window.days.includes(day)), from: window.from, until,
+      notes: String(window.notes || '').trim().slice(0, 200) }
+  })
+}
+
+function availabilityFromRecords(records) {
+  const byDoctor = Object.create(null)
+  records.forEach(row => {
+    const id = String(row['Doctor ID'] || '').trim()
+    if (!id) return
+    const window = { days: parseDays(row.Days), from: parseClock(row.From) || String(row.From || ''),
+      until: parseClock(row.Until) || String(row.Until || ''), notes: String(row.Notes || '').trim() }
+    if (!byDoctor[id]) byDoctor[id] = []
+    byDoctor[id].push(window)
+  })
+  return byDoctor
+}
+
+// END SHARED AVAILABILITY
