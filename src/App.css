@@ -147,25 +147,29 @@
   padding: 14px 16px calc(96px + var(--safe-bottom));
 }
 
+.daily-filters {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 10px;
+}
 .daily-camp-picker {
   display: grid;
   min-width: 0;
-  grid-template-columns: 32px minmax(0, 1fr) minmax(128px, 46%);
+  grid-template-columns: 24px minmax(0, 1fr);
   align-items: center;
-  gap: 8px;
-  min-height: 48px;
-  margin-bottom: 10px;
-  padding: 6px 7px 6px 8px;
+  gap: 6px;
+  padding: 8px;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 13px;
   box-shadow: var(--shadow-sm);
 }
-.daily-camp-icon { display: grid; width: 30px; height: 30px; place-items: center; color: var(--accent-strong); background: var(--accent-soft); border-radius: 9px; }
+.daily-camp-icon { display: grid; width: 24px; height: 24px; place-items: center; color: var(--accent-strong); background: var(--accent-soft); border-radius: 7px; }
 .daily-camp-copy { display: flex; min-width: 0; flex-direction: column; }
 .daily-camp-copy strong { color: var(--ink); font-size: 11px; font-weight: 760; }
 .daily-camp-copy small { margin-top: 1px; color: var(--muted); font-size: 8px; }
-.daily-camp-picker select { width: 100%; min-width: 0; min-height: 34px; padding: 0 25px 0 8px; overflow: hidden; color: var(--ink); background: var(--surface-soft); border: 1px solid var(--border); border-radius: 9px; outline: 0; font-size: 10px; font-weight: 680; text-overflow: ellipsis; }
+.daily-camp-picker select { grid-column: 1 / -1; width: 100%; min-width: 0; min-height: 34px; padding: 0 25px 0 8px; overflow: hidden; color: var(--ink); background: var(--surface-soft); border: 1px solid var(--border); border-radius: 9px; outline: 0; font-size: 10px; font-weight: 680; text-overflow: ellipsis; }
 .daily-camp-picker select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 10%, transparent); }
 
 .page {

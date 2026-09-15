@@ -240,7 +240,7 @@ export function Visits({ doctors, visits, settings, defaultCamp, focusDoctorId, 
   const campDoctors = doctors.filter((doctor) => doctor.camp === activeCamp)
   const specialties = unique(campDoctors.flatMap((doctor) => doctor.specialties))
   const callSchedules = unique(settings.callSchedules)
-  const lastVisitMap = useMemo(() => buildLastVisitMap(visits), [visits])
+  const lastVisitMap = useMemo(() => buildLastVisitMap(visits, date), [visits, date])
 
   const filteredDoctors = campDoctors
     .filter((doctor) => !query || [doctor.name, doctor.hospital, doctor.pharmacy]
@@ -456,8 +456,8 @@ export function Visits({ doctors, visits, settings, defaultCamp, focusDoctorId, 
                       <div>
                         <strong>{doctor.name}</strong>
                         <p>{[doctor.specialties.join(', '), doctor.pharmacy].filter(Boolean).join(' · ')}</p>
-                        <small className={isVisitStale(lastDate) ? 'stale' : ''}>
-                          <Clock3 size={12} /> {relativeVisitLabel(lastDate)}
+                        <small className={isVisitStale(lastDate, date) ? 'stale' : ''}>
+                          <Clock3 size={12} /> {relativeVisitLabel(lastDate, date)}
                         </small>
                       </div>
                     </button>

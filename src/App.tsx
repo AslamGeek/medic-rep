@@ -25,7 +25,7 @@ import { DoctorDetail } from './components/DoctorDetail'
 import { DoctorForm } from './components/DoctorForm'
 import { Visits } from './components/Visits'
 import { onSyncStatus, queueChange, syncNow, type SyncDetail } from './sync'
-import { formatDate, localDateString } from './utils'
+import { formatDate, localDateString, normalize } from './utils'
 import {
   EMPTY_FILTERS,
   type AppSnapshot,
@@ -38,6 +38,7 @@ import {
 type Section = 'directory' | 'visits'
 type Theme = 'light' | 'dark'
 const DAILY_CAMP_STORAGE_KEY = 'medrep-daily-camp'
+const DEFAULT_CALL_SCHEDULE = 'Everyday'
 
 function readDailyCamp(): string {
   try {
@@ -143,6 +144,7 @@ function App() {
   const [filters, setFilters] = useState<FilterState>(() => ({
     ...structuredClone(EMPTY_FILTERS),
     camp: dailyCamp ? [dailyCamp] : [],
+    callSchedule: [DEFAULT_CALL_SCHEDULE],
   }))
   const [editingDoctor, setEditingDoctor] = useState<Doctor | null | undefined>(undefined)
   const [selectedDoctor, setSelectedDoctor] = useState<Doctor | null>(null)
@@ -352,6 +354,15 @@ function App() {
     (camp) => camp.toLocaleLowerCase() === dailyCamp.toLocaleLowerCase(),
   ) ?? ''
 
+  const callSchedules = [...new Map([
+    DEFAULT_CALL_SCHEDULE,
+    ...snapshot.master.settings.callSchedules,
+    ...snapshot.doctors.map((doctor) => doctor.callSchedule),
+  ].map((value) => value.trim()).filter(Boolean).map((value) => [normalize(value), value])).values()]
+  const activeCallSchedule = filters.callSchedule.length > 1
+    ? '__multiple__'
+    : callSchedules.find((value) => normalize(value) === normalize(filters.callSchedule[0])) ?? ''
+
   const needsApiSetup =
     syncDetail.phase === 'error' &&
     snapshot.master.settings.areas.length === 0 &&
@@ -404,6 +415,7 @@ function App() {
 
       <main className="main-content">
         {!loading && section === 'directory' && snapshot.master.settings.camps.length > 0 && (
+          <div className="daily-filters">
           <label className="daily-camp-picker">
             <span className="daily-camp-icon"><MapPin size={17} /></span>
             <span className="daily-camp-copy">
@@ -420,6 +432,26 @@ function App() {
               ))}
             </select>
           </label>
+          <label className="daily-camp-picker">
+            <span className="daily-camp-icon"><CalendarDays size={17} /></span>
+            <span className="daily-camp-copy">
+              <strong>Call schedule</strong>
+              <small>Filter doctors</small>
+            </span>
+            <select
+              aria-label="Filter doctors by call schedule"
+              value={activeCallSchedule}
+              onChange={(event) => {
+                const schedule = event.target.value
+                setFilters((current) => ({ ...current, callSchedule: schedule ? [schedule] : [] }))
+              }}
+            >
+              <option value="">All schedules</option>
+              {filters.callSchedule.length > 1 && <option value="__multiple__" disabled>Multiple schedules</option>}
+              {callSchedules.map((schedule) => <option key={schedule}>{schedule}</option>)}
+            </select>
+          </label>
+          </div>
         )}
         {loading ? (
           <div className="app-loading"><div className="loading-mark"><Stethoscope size={25} /></div><strong>Opening your field desk…</strong></div>

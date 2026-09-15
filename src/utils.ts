@@ -112,10 +112,10 @@ export function visitDoctorName(line: string): string {
   return (specialtyStart > 0 ? displayLine.slice(0, specialtyStart) : displayLine).trim()
 }
 
-export function buildLastVisitMap(visits: Visit[]): Map<string, string> {
+export function buildLastVisitMap(visits: Visit[], asOfDate?: string): Map<string, string> {
   const map = new Map<string, string>()
   visits
-    .filter((visit) => visit.kind === 'Visit')
+    .filter((visit) => visit.kind === 'Visit' && (!asOfDate || visit.date <= asOfDate))
     .forEach((visit) => {
       visit.doctorLines.forEach((line) => {
         const id = doctorIdFromVisitLine(line)
@@ -129,23 +129,21 @@ export function buildLastVisitMap(visits: Visit[]): Map<string, string> {
   return map
 }
 
-export function relativeVisitLabel(dateString?: string): string {
-  if (!dateString) return 'Never visited'
+function calendarDayNumber(dateString: string): number {
   const [year, month, day] = dateString.split('-').map(Number)
-  const then = new Date(year, month - 1, day).getTime()
-  const [todayYear, todayMonth, todayDay] = localDateString().split('-').map(Number)
-  const today = new Date(todayYear, todayMonth - 1, todayDay).getTime()
-  const days = Math.max(0, Math.round((today - then) / 86_400_000))
-  if (days === 0) return 'Visited today'
+  return Date.UTC(year, month - 1, day) / 86_400_000
+}
+
+export function relativeVisitLabel(dateString?: string, referenceDate = localDateString()): string {
+  if (!dateString) return 'Never visited'
+  const days = Math.max(0, calendarDayNumber(referenceDate) - calendarDayNumber(dateString))
+  if (days === 0) return referenceDate === localDateString() ? 'Visited today' : 'Visited on selected date'
   if (days === 1) return '1 day ago'
   return `${days} days ago`
 }
 
-export function isVisitStale(dateString?: string): boolean {
+export function isVisitStale(dateString?: string, referenceDate = localDateString()): boolean {
   if (!dateString) return true
-  const [year, month, day] = dateString.split('-').map(Number)
-  const days = Math.round(
-    (Date.now() - new Date(year, month - 1, day).getTime()) / 86_400_000,
-  )
+  const days = calendarDayNumber(referenceDate) - calendarDayNumber(dateString)
   return days >= 14
 }
