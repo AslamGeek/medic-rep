@@ -609,6 +609,30 @@ function doctorCellValue_(doctor, canonical, products) {
   return map[canonical];
 }
 
+// Sort whole records with Sheets' native sort so cell contents stay together.
+// Row 1 remains the header; resolve columns by name to support reordered sheets.
+function sortDoctorRows_(sheet) {
+  var rowCount = sheet.getLastRow() - 1;
+  if (rowCount < 2) return;
+  var headers = readHeaders_(sheet);
+  sheet.getRange(2, 1, rowCount, sheet.getLastColumn()).sort([
+    { column: columnIndex_(headers, 'Camp') + 1, ascending: true },
+    { column: columnIndex_(headers, 'ID') + 1, ascending: true }
+  ]);
+}
+
+// Optional editor action to organize existing records before the next app save.
+function sortDoctors() {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    sortDoctorRows_(sheet_('Doctors'));
+    SpreadsheetApp.flush();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
 function upsertDoctor_(input, lockHeld) {
   var isNewRecord = input && input.isNewRecord === true;
   var products = getProducts_();
@@ -651,6 +675,7 @@ function upsertDoctor_(input, lockHeld) {
     } else {
       sheet.appendRow(existingRow);
     }
+    sortDoctorRows_(sheet);
     return { doctor: doctor };
   } finally {
     if (!lockHeld) lock.releaseLock();

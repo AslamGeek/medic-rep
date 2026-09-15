@@ -3,7 +3,7 @@ import { productIdsFromCell } from '../shared/products.js'
 
 const SPREADSHEET_ID = '1Zg5Rxn6TNskev1EFwwrZI9gWP1mDyifBg6ACI_YTFxU'
 const DEFAULT_GAS_WEB_APP_URL =
-  'https://script.google.com/macros/s/AKfycbyXpOujmrKS5oGnxTFiK1Mwd87SQTkEqThcALiZia0_e3RB7Kc02Qf9bmP7pl1E5ifg/exec'
+  'https://script.google.com/macros/s/AKfycbwfIkuC5YNNNb2KykmVsCQiD9PDwmHKUmIwOhItV6xvlOp7RvgVPOgOC6xNN-eEuAc4/exec'
 
 function parseCsv(text) {
   const rows = []

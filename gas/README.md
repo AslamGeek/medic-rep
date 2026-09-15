@@ -6,7 +6,7 @@ The app is already configured for spreadsheet:
 
 The current web-app deployment is:
 
-`https://script.google.com/macros/s/AKfycbyXpOujmrKS5oGnxTFiK1Mwd87SQTkEqThcALiZia0_e3RB7Kc02Qf9bmP7pl1E5ifg/exec`
+`https://script.google.com/macros/s/AKfycbwfIkuC5YNNNb2KykmVsCQiD9PDwmHKUmIwOhItV6xvlOp7RvgVPOgOC6xNN-eEuAc4/exec`
 
 1. Open the Apps Script project used for the web-app URL.
 2. Replace its `Code.gs` with the included `Code.gs`.
@@ -53,6 +53,21 @@ refresh. Measure end-to-end write time on the deployed app; local regression tes
 do not establish a production latency guarantee.
 
 ## Updating an existing deployment
+
+### Automatic doctor row ordering
+
+Every doctor saved from the app sorts the Doctors tab by Camp (A–Z), then ID
+(ascending). For example, `PDTR-016` appears immediately after `PDTR-015` in the
+same camp group. Sorting includes all populated columns and excludes the header.
+IDs are retained; row ordering does not change visit references.
+
+Replace `Code.gs` and deploy a new version of the existing Apps Script deployment
+to activate this behavior. Optionally run `sortDoctors` once in the Apps Script
+editor to sort existing records immediately; otherwise the next app doctor save
+sorts them. Direct edits in Sheets are sorted on the next app doctor save or by
+running `sortDoctors`.
+
+### Deployment steps
 
 A GitHub push and Vercel deployment do **not** update Apps Script. Replace the
 Apps Script project's `Code.gs` with this file, save it, then open **Deploy →

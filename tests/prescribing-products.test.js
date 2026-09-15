@@ -27,6 +27,16 @@ function sheet(rows) {
       setValues: (values) => values.forEach((cells, index) => {
         rows[row - 1 + index].splice(column - 1, width, ...cells)
       }),
+      sort: (specs) => {
+        const sorted = rows.slice(row - 1, row - 1 + height).sort((a, b) => {
+          for (const spec of specs) {
+            const order = String(a[spec.column - 1]).localeCompare(String(b[spec.column - 1]))
+            if (order) return spec.ascending ? order : -order
+          }
+          return 0
+        })
+        rows.splice(row - 1, height, ...sorted)
+      },
     }),
   }
 }
@@ -122,6 +132,46 @@ test('invalid product IDs are rejected before writing a doctor', () => {
   const { context, sheets, input } = fixture()
   assert.throws(() => context.upsertDoctor_({ ...input, prescribingProductIds: ['missing'] }), /Product must come from/)
   assert.equal(sheets.Doctors.rows.length, 1)
+})
+
+test('new doctors stay in camp and ID order, and edits still target the correct doctor after sorting', () => {
+  const { context, sheets, input } = fixture()
+  for (let number = 1; number <= 15; number++) {
+    context.upsertDoctor_({ ...input, name: `Proddatur Doctor ${number}` })
+  }
+  for (const camp of ['Zeta Camp', 'Alpha Camp']) {
+    sheets.Settings.rows.push(['', '', camp, '', '', '', ''])
+    context.upsertDoctor_({ ...input, name: `${camp} Doctor`, camp })
+  }
+  const saved = context.upsertDoctor_({ ...input, name: 'New Proddatur Doctor' }).doctor
+  assert.equal(saved.id, 'PDTR-016')
+  const header = sheets.Doctors.rows[0]
+  const idColumn = header.indexOf('ID')
+  const nameColumn = header.indexOf('Name')
+  const ids = sheets.Doctors.rows.slice(1).map(row => row[idColumn])
+  assert.deepEqual(ids, ['ALPH-001', ...Array.from({ length: 16 }, (_, index) => `PDTR-${String(index + 1).padStart(3, '0')}`), 'ZETA-001'])
+  context.upsertDoctor_({ ...saved, name: 'Renamed Doctor', notes: 'Keep with PDTR-016' })
+  const edited = sheets.Doctors.rows.find(row => row[idColumn] === 'PDTR-016')
+  assert.equal(edited[nameColumn], 'Renamed Doctor')
+  assert.equal(edited[header.indexOf('Notes')], 'Keep with PDTR-016')
+  assert.equal(sheets.Doctors.rows.length, 19)
+  assert.deepEqual(header, Array.from(context.SHEET_HEADERS.Doctors))
+})
+
+test('manual doctor sorting handles reordered columns and keeps extra cells with their record', () => {
+  const { context, sheets } = fixture()
+  sheets.Doctors.rows.splice(0, sheets.Doctors.rows.length,
+    ['Remarks', 'Camp', 'DocID', 'Name', 'Extra'],
+    ['third', 'Zeta', 'ZETA-001', 'Third', '=1+3'],
+    ['second', 'Alpha', 'ALPH-010', 'Second', '=1+2'],
+    ['first', 'Alpha', 'ALPH-009', 'First', '=1+1'])
+  context.sortDoctors()
+  assert.deepEqual(sheets.Doctors.rows, [
+    ['Remarks', 'Camp', 'DocID', 'Name', 'Extra'],
+    ['first', 'Alpha', 'ALPH-009', 'First', '=1+1'],
+    ['second', 'Alpha', 'ALPH-010', 'Second', '=1+2'],
+    ['third', 'Zeta', 'ZETA-001', 'Third', '=1+3'],
+  ])
 })
 
 test('editing a legacy doctor and adding a product accepts existing spacing and dosage abbreviations', () => {
