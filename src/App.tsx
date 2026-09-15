@@ -25,7 +25,7 @@ import { DoctorDetail } from './components/DoctorDetail'
 import { DoctorForm } from './components/DoctorForm'
 import { Visits } from './components/Visits'
 import { onSyncStatus, queueChange, syncNow, type SyncDetail } from './sync'
-import { formatDate, localDateString, normalize } from './utils'
+import { dayName, formatDate, localDateString, normalize } from './utils'
 import {
   EMPTY_FILTERS,
   type AppSnapshot,
@@ -39,6 +39,14 @@ type Section = 'directory' | 'visits'
 type Theme = 'light' | 'dark'
 const DAILY_CAMP_STORAGE_KEY = 'medrep-daily-camp'
 const DEFAULT_CALL_SCHEDULE = 'Everyday'
+const PRODDATUR_CALL_SCHEDULE = 'Tue & Fri'
+
+function defaultCallSchedule(camp: string): string {
+  const weekday = new Date().getDay()
+  return normalize(camp) === 'proddatur' && (weekday === 2 || weekday === 5)
+    ? PRODDATUR_CALL_SCHEDULE
+    : DEFAULT_CALL_SCHEDULE
+}
 
 function readDailyCamp(): string {
   try {
@@ -144,7 +152,7 @@ function App() {
   const [filters, setFilters] = useState<FilterState>(() => ({
     ...structuredClone(EMPTY_FILTERS),
     camp: dailyCamp ? [dailyCamp] : [],
-    callSchedule: [DEFAULT_CALL_SCHEDULE],
+    callSchedule: [defaultCallSchedule(dailyCamp)],
   }))
   const [editingDoctor, setEditingDoctor] = useState<Doctor | null | undefined>(undefined)
   const [selectedDoctor, setSelectedDoctor] = useState<Doctor | null>(null)
@@ -164,7 +172,9 @@ function App() {
       dailyCampInitialized.current = true
       setDailyCamp(firstCamp)
       saveDailyCamp(firstCamp)
-      setFilters((current) => current.camp.length ? current : { ...current, camp: [firstCamp] })
+      setFilters((current) => current.camp.length ? current : {
+        ...current, camp: [firstCamp], callSchedule: [defaultCallSchedule(firstCamp)],
+      })
       setVisitsContextVersion((current) => current + 1)
     }
   }, [])
@@ -187,7 +197,9 @@ function App() {
       setFilters((current) => {
         const stillUsingDailyDefault = current.camp.length === 1
           && current.camp[0].toLocaleLowerCase() === dailyCamp.toLocaleLowerCase()
-        return stillUsingDailyDefault ? { ...current, camp: [] } : current
+        return stillUsingDailyDefault
+          ? { ...current, camp: [], callSchedule: [DEFAULT_CALL_SCHEDULE] }
+          : current
       })
       setFocusDoctorId(null)
       setVisitsContextVersion((current) => current + 1)
@@ -345,7 +357,9 @@ function App() {
     dailyCampInitialized.current = true
     setDailyCamp(camp)
     saveDailyCamp(camp)
-    setFilters((current) => ({ ...current, camp: camp ? [camp] : [] }))
+    setFilters((current) => ({
+      ...current, camp: camp ? [camp] : [], callSchedule: [defaultCallSchedule(camp)],
+    }))
     setFocusDoctorId(null)
     setVisitsContextVersion((current) => current + 1)
   }
@@ -356,6 +370,7 @@ function App() {
 
   const callSchedules = [...new Map([
     DEFAULT_CALL_SCHEDULE,
+    PRODDATUR_CALL_SCHEDULE,
     ...snapshot.master.settings.callSchedules,
     ...snapshot.doctors.map((doctor) => doctor.callSchedule),
   ].map((value) => value.trim()).filter(Boolean).map((value) => [normalize(value), value])).values()]
@@ -420,7 +435,7 @@ function App() {
             <span className="daily-camp-icon"><MapPin size={17} /></span>
             <span className="daily-camp-copy">
               <strong>Today’s camp</strong>
-              <small>{formatDate(localDateString())}</small>
+              <small>{dayName(localDateString())} · {formatDate(localDateString())}</small>
             </span>
             <select
               aria-label="Set today's default camp"
