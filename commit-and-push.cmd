@@ -50,8 +50,7 @@ if not errorlevel 1 (
   goto :push
 )
 
-rem Pass the message through standard input so quotes and special characters are safe.
-powershell.exe -NoLogo -NoProfile -Command "$OutputEncoding = New-Object System.Text.UTF8Encoding($false); $message = Read-Host 'Commit message [Update MedRep app]'; if ([string]::IsNullOrWhiteSpace($message)) { $message = 'Update MedRep app' }; $message | git commit --file=-; exit $LASTEXITCODE"
+git commit -m "Update MedRep app"
 if errorlevel 1 goto :failed
 
 :push
@@ -62,7 +61,6 @@ echo.
 echo Push completed successfully.
 echo App: %app_url%
 echo Check Vercel for deployment progress.
-pause
 exit /b 0
 
 :failed
