@@ -3,7 +3,6 @@ import {
   CalendarDays,
   Check,
   CloudOff,
-  Download,
   MapPin,
   Moon,
   Plus,
@@ -70,11 +69,6 @@ function saveDailyCamp(camp: string) {
   }
   const date = localDateString()
   localStorage.setItem(DAILY_CAMP_STORAGE_KEY, JSON.stringify({ date, camp }))
-}
-
-interface InstallPromptEvent extends Event {
-  prompt: () => Promise<void>
-  userChoice: Promise<{ outcome: 'accepted' | 'dismissed' }>
 }
 
 interface ToastState {
@@ -158,7 +152,6 @@ function App() {
   const [selectedDoctor, setSelectedDoctor] = useState<Doctor | null>(null)
   const [focusDoctorId, setFocusDoctorId] = useState<string | null>(null)
   const [toast, setToast] = useState<ToastState | null>(null)
-  const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent | null>(null)
   const [theme, setTheme] = useState<Theme>(() => {
     const stored = localStorage.getItem('medrep-theme')
     if (stored === 'light' || stored === 'dark') return stored
@@ -261,14 +254,9 @@ function App() {
     const visible = () => {
       if (document.visibilityState === 'visible') void syncNow().then(reload)
     }
-    const beforeInstall = (event: Event) => {
-      event.preventDefault()
-      setInstallPrompt(event as InstallPromptEvent)
-    }
     window.addEventListener('online', online)
     window.addEventListener('focus', online)
     window.addEventListener('offline', offline)
-    window.addEventListener('beforeinstallprompt', beforeInstall)
     document.addEventListener('visibilitychange', visible)
     void syncNow().then(reload)
 
@@ -278,7 +266,6 @@ function App() {
       window.removeEventListener('online', online)
       window.removeEventListener('focus', online)
       window.removeEventListener('offline', offline)
-      window.removeEventListener('beforeinstallprompt', beforeInstall)
       document.removeEventListener('visibilitychange', visible)
     }
   }, [acceptSnapshot, reload])
@@ -334,13 +321,6 @@ function App() {
     await reload()
   }
 
-  const install = async () => {
-    if (!installPrompt) return
-    await installPrompt.prompt()
-    const choice = await installPrompt.userChoice
-    if (choice.outcome === 'accepted') setInstallPrompt(null)
-  }
-
   const logFromDoctor = (doctor: Doctor) => {
     setSelectedDoctor(null)
     setFocusDoctorId(doctor.id)
@@ -392,7 +372,6 @@ function App() {
           <div><p className="eyebrow">Field companion</p><h1>{APP_NAME}</h1></div>
         </div>
         <div className="header-actions">
-          {installPrompt && <button className="icon-button" onClick={install} aria-label="Install app"><Download size={19} /></button>}
           <SyncBadge
             detail={syncDetail}
             onRetry={() => void retrySync().then(reload)}

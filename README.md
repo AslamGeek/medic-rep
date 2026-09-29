@@ -1,6 +1,6 @@
 # MedRep Field Companion
 
-A mobile-first, installable Progressive Web App for a single medical representative. The app works from IndexedDB first, so search, editing, and visit logging remain fast and available without a network connection. Changes synchronize with Google Sheets in the background through Google Apps Script.
+A mobile-first website for a single medical representative. Bookmark its URL and open it in your mobile browser; no app installation is needed. Records and pending edits remain in IndexedDB, and changes synchronize with Google Sheets through Google Apps Script while the page is open. Loading or reloading the website requires a network connection.
 
 ## Included
 
@@ -15,7 +15,7 @@ A mobile-first, installable Progressive Web App for a single medical representat
 - Sunday, Holiday, and Leave logging without doctor selection
 - Local-first save, automatic retry, and short Undo
 - Visit history and monthly calendar
-- Light/dark mode and installable offline app shell
+- Light/dark mode and bookmark-friendly mobile browser access
 - Legacy doctor-header adapter without rewriting existing rows
 - Visit now: actual local weekday/time, call windows, camp/call schedule/OP timing filters
 - Availability order and persistent manual card order for each camp on this device
@@ -161,7 +161,7 @@ If the Apps Script URL changes, update `GAS_WEB_APP_URL` in Vercel (if set) and 
 
 ## Master-data behavior
 
-Areas, specialties, camps, potentials, stockists, OP timings, and call schedules come only from the `Settings` sheet. Products come only from the `Products` sheet. The app intentionally provides no Settings screen; edit these lists directly in Google Sheets, then reopen the PWA online.
+Areas, specialties, camps, potentials, stockists, OP timings, and call schedules come only from the `Settings` sheet. Products come only from the `Products` sheet. The app intentionally provides no Settings screen; edit these lists directly in Google Sheets, then reopen the website online.
 
 ## Versioned sync deployment checklist
 
@@ -207,5 +207,5 @@ when rows move or new visits are inserted.
 
 A missing remote row is not a deletion receipt: refresh preserves local records.
 Manual deletion propagation requires explicit tombstones and is outside this
-merge protocol. Offline writes are sent while the PWA is open or reopened;
+merge protocol. Offline writes are sent while the website is open or reopened;
 there is no operating-system background worker that runs after the app closes.
