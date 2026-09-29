@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { memo, useEffect, useMemo, useState } from 'react'
 import {
   Bookmark,
   Check,
@@ -11,6 +11,8 @@ import {
   X,
 } from 'lucide-react'
 import { MAX_VISIBLE_DOCTORS } from '../config'
+import { filterDirectory, indexDirectory, type FilterGroup } from '../directoryFilters'
+import './DirectoryFilters.css'
 import {
   EMPTY_FILTERS,
   type Doctor,
@@ -20,10 +22,7 @@ import {
   type Product,
 } from '../types'
 import {
-  doctorProductNames,
   normalize,
-  productLabel,
-  unique,
 } from '../utils'
 
 interface DirectoryProps {
@@ -37,84 +36,6 @@ interface DirectoryProps {
   onOpen: (doctor: Doctor) => void
   onSavePreset: (name: string, filters: FilterState) => void
   onDeletePreset: (id: string) => void
-}
-
-interface FilterGroup {
-  key: keyof FilterState
-  label: string
-  items: { id: string; label: string }[]
-}
-
-function doctorHasProduct(doctor: Doctor, productId: string, products: Product[]) {
-  const product = products.find(
-    (item) => normalize(item.prodId) === normalize(productId),
-  )
-  return doctor.prescribingProductIds.some((value) => {
-    if (normalize(value) === normalize(productId)) return true
-    return product ? normalize(value).includes(normalize(product.name)) : false
-  })
-}
-
-function matchesGroup(
-  doctor: Doctor,
-  key: keyof FilterState,
-  values: string[],
-  products: Product[],
-): boolean {
-  if (!values.length) return true
-  return values.some((value) => {
-    switch (key) {
-      case 'area':
-        return normalize(doctor.area) === normalize(value)
-      case 'camp':
-        return normalize(doctor.camp) === normalize(value)
-      case 'specialty':
-        return doctor.specialties.some(
-          (item) => normalize(item) === normalize(value),
-        )
-      case 'callSchedule':
-        return normalize(doctor.callSchedule) === normalize(value)
-      case 'product':
-        return doctorHasProduct(doctor, value, products)
-      case 'potential':
-        return normalize(doctor.potential) === normalize(value)
-      case 'prescriber':
-        return doctor.prescriber === value
-    }
-  })
-}
-
-function applyFilters(
-  doctors: Doctor[],
-  query: string,
-  filters: FilterState,
-  products: Product[],
-) {
-  const normalizedQuery = normalize(query)
-  return doctors
-    .filter((doctor) => {
-      if (!normalizedQuery) return true
-      const productNames = doctorProductNames(doctor, products)
-      return [
-        doctor.name,
-        doctor.hospital,
-        doctor.pharmacy,
-        doctor.area,
-        doctor.camp,
-        doctor.specialties.join(' '),
-        doctor.prescribingProductIds.join(' '),
-        productNames.join(' '),
-      ].some((value) => normalize(value).includes(normalizedQuery))
-    })
-    .filter((doctor) =>
-      (Object.keys(filters) as (keyof FilterState)[]).every((key) =>
-        matchesGroup(doctor, key, filters[key], products),
-      ),
-    )
-    .sort((a, b) => {
-      if (a.prescriber !== b.prescriber) return a.prescriber === 'Rx' ? -1 : 1
-      return a.name.localeCompare(b.name)
-    })
 }
 
 function activeFilterCount(filters: FilterState) {
@@ -183,10 +104,9 @@ function automaticTemplateName(
   return `${baseName} · ${suffix}`
 }
 
-function FilterSheet({
+export function FilterSheet({
   open,
-  doctors,
-  settings,
+  groups,
   products,
   filters,
   presets,
@@ -196,8 +116,7 @@ function FilterSheet({
   onDeletePreset,
 }: {
   open: boolean
-  doctors: Doctor[]
-  settings: MasterSettings
+  groups: FilterGroup[]
   products: Product[]
   filters: FilterState
   presets: FilterPreset[]
@@ -206,52 +125,12 @@ function FilterSheet({
   onSavePreset: (name: string, filters: FilterState) => void
   onDeletePreset: (id: string) => void
 }) {
-  const callSchedules = unique([
-    ...settings.callSchedules,
-    ...doctors.map((doctor) => doctor.callSchedule),
-  ])
-  const groups: FilterGroup[] = [
-    {
-      key: 'prescriber',
-      label: 'Prescriber',
-      items: [
-        { id: 'Rx', label: 'Rx' },
-        { id: 'NRx', label: 'NRx' },
-      ],
-    },
-    { key: 'area', label: 'Area', items: settings.areas.map((id) => ({ id, label: id })) },
-    { key: 'camp', label: 'Camp', items: settings.camps.map((id) => ({ id, label: id })) },
-    {
-      key: 'specialty',
-      label: 'Specialty',
-      items: settings.specialties.map((id) => ({ id, label: id })),
-    },
-    {
-      key: 'callSchedule',
-      label: 'Call schedule',
-      items: callSchedules.map((id) => ({ id, label: id })),
-    },
-    {
-      key: 'product',
-      label: 'Product',
-      items: products.map((product) => ({
-        id: product.prodId,
-        label: productLabel(product),
-      })),
-    },
-    {
-      key: 'potential',
-      label: 'Potential',
-      items: settings.potentials.map((id) => ({ id, label: id })),
-    },
-  ]
-
   if (!open) return null
 
   const toggle = (key: keyof FilterState, value: string) => {
     const selected = filters[key] as string[]
-    const next = selected.includes(value)
-      ? selected.filter((item) => item !== value)
+    const next = selected.some(item => normalize(item) === normalize(value))
+      ? selected.filter((item) => normalize(item) !== normalize(value))
       : [...selected, value]
     onChange({ ...filters, [key]: next })
   }
@@ -308,21 +187,25 @@ function FilterSheet({
             {group.items.length ? (
               <div className="chip-row">
                 {group.items.map((item) => {
-                  const selected = (filters[group.key] as string[]).includes(item.id)
+                  const selected = filters[group.key].some(value => normalize(value) === normalize(item.id))
                   return (
                     <button
-                      className={`choice-chip ${selected ? 'selected' : ''}`}
+                      className={`choice-chip directory-filter-option ${selected ? 'selected' : ''}`}
+                      aria-pressed={selected}
+                      aria-label={`${item.label} (${item.count})`}
+                      title={`${item.label} (${item.count})`}
                       key={item.id}
                       onClick={() => toggle(group.key, item.id)}
                     >
                       {selected && <Check size={13} />}
-                      {item.label}
+                      <span className="directory-filter-label">{item.label}</span>
+                      <span className="directory-filter-count">({item.count})</span>
                     </button>
                   )
                 })}
               </div>
             ) : (
-              <p className="muted-inline">No values in the sheet yet.</p>
+              <p className="muted-inline">No matching options.</p>
             )}
           </section>
         ))}
@@ -350,6 +233,44 @@ function FilterSheet({
   )
 }
 
+const DoctorCard = memo(function DoctorCard({ doctor, productNames, onOpen }: {
+  doctor: Doctor
+  productNames: string[]
+  onOpen: (doctor: Doctor) => void
+}) {
+  return (
+    <button
+      className={`doctor-card ${doctor.prescriber === 'Rx' ? 'rx' : ''}`}
+      onClick={() => onOpen(doctor)}
+    >
+      <div className="doctor-card-main">
+        <div className="doctor-title-row">
+          <h3>{doctor.name}</h3>
+        </div>
+        <p>
+          {[doctor.hospital, doctor.pharmacy].filter(Boolean).join(' · ') ||
+            doctor.camp}
+        </p>
+        <div className="mini-tags">
+          {doctor.specialties.slice(0, 2).map((specialty) => (
+            <span key={specialty}>{specialty}</span>
+          ))}
+          {doctor.potential && <span>{doctor.potential}</span>}
+        </div>
+        {doctor.prescriber === 'Rx' && productNames.length > 0 && (
+          <div className="product-line">{productNames.join(', ')}</div>
+        )}
+      </div>
+      <span
+        className={`rx-badge prescriber-badge ${doctor.prescriber === 'Rx' ? 'rx' : 'nrx'}`}
+      >
+        {doctor.prescriber}
+      </span>
+      <ChevronRight className="card-chevron" size={20} />
+    </button>
+  )
+})
+
 export function Directory({
   doctors,
   products,
@@ -364,10 +285,13 @@ export function Directory({
 }: DirectoryProps) {
   const [query, setQuery] = useState('')
   const [filtersOpen, setFiltersOpen] = useState(false)
-  const filtered = useMemo(
-    () => applyFilters(doctors, query, filters, products),
-    [doctors, query, filters, products],
-  )
+  const index = useMemo(() => indexDirectory(doctors, products, settings), [doctors, products, settings])
+  const result = useMemo(() => filterDirectory(index, query, filters), [index, query, filters])
+  const filtered = result.doctors
+  const activeFilters = result.filters
+  useEffect(() => {
+    if (activeFilters !== filters) onFiltersChange(activeFilters)
+  }, [activeFilters, filters, onFiltersChange])
 
   const metrics = useMemo(() => {
     const hospitalSet = new Set(filtered.map((doctor) => normalize(doctor.hospital)).filter(Boolean))
@@ -381,7 +305,11 @@ export function Directory({
     }
   }, [filtered])
 
-  const count = activeFilterCount(filters)
+  const doctorCards = useMemo(() => filtered.slice(0, MAX_VISIBLE_DOCTORS).map(doctor => (
+    <DoctorCard key={doctor.id} doctor={doctor} productNames={index.productNames.get(doctor.id)!} onOpen={onOpen} />
+  )), [filtered, index, onOpen])
+
+  const count = activeFilterCount(activeFilters)
 
   return (
     <section className="page directory-page">
@@ -449,41 +377,7 @@ export function Directory({
         </div>
       ) : (
         <div className="doctor-list">
-          {filtered.slice(0, MAX_VISIBLE_DOCTORS).map((doctor) => {
-            const productNames = doctorProductNames(doctor, products)
-            return (
-              <button
-                className={`doctor-card ${doctor.prescriber === 'Rx' ? 'rx' : ''}`}
-                key={doctor.id}
-                onClick={() => onOpen(doctor)}
-              >
-                <div className="doctor-card-main">
-                  <div className="doctor-title-row">
-                    <h3>{doctor.name}</h3>
-                  </div>
-                  <p>
-                    {[doctor.hospital, doctor.pharmacy].filter(Boolean).join(' · ') ||
-                      doctor.camp}
-                  </p>
-                  <div className="mini-tags">
-                    {doctor.specialties.slice(0, 2).map((specialty) => (
-                      <span key={specialty}>{specialty}</span>
-                    ))}
-                    {doctor.potential && <span>{doctor.potential}</span>}
-                  </div>
-                  {doctor.prescriber === 'Rx' && productNames.length > 0 && (
-                    <div className="product-line">{productNames.join(', ')}</div>
-                  )}
-                </div>
-                <span
-                  className={`rx-badge prescriber-badge ${doctor.prescriber === 'Rx' ? 'rx' : 'nrx'}`}
-                >
-                  {doctor.prescriber}
-                </span>
-                <ChevronRight className="card-chevron" size={20} />
-              </button>
-            )
-          })}
+          {doctorCards}
           {filtered.length > MAX_VISIBLE_DOCTORS && (
             <p className="list-limit-note">Refine the search to see the remaining doctors.</p>
           )}
@@ -492,10 +386,9 @@ export function Directory({
 
       <FilterSheet
         open={filtersOpen}
-        doctors={doctors}
-        settings={settings}
+        groups={result.groups}
         products={products}
-        filters={filters}
+        filters={activeFilters}
         presets={presets}
         onChange={onFiltersChange}
         onClose={() => setFiltersOpen(false)}

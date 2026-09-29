@@ -1,0 +1,20 @@
+.filter-sheet .directory-filter-option {
+  max-width: 100%;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.directory-filter-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.directory-filter-count,
+.directory-filter-option > svg {
+  flex-shrink: 0;
+}
+
+.directory-filter-count {
+  font-variant-numeric: tabular-nums;
+}
