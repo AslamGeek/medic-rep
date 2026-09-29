@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   CalendarDays,
-  Clock3,
   Check,
   CloudOff,
   Download,
@@ -25,7 +24,6 @@ import { Directory } from './components/Directory'
 import { DoctorDetail } from './components/DoctorDetail'
 import { DoctorForm } from './components/DoctorForm'
 import { Visits } from './components/Visits'
-import { VisitNow } from './components/VisitNow'
 import { onSyncStatus, queueChange, syncNow, retrySync, type SyncDetail } from './sync'
 import { dayName, formatDate, localDateString, normalize } from './utils'
 import {
@@ -37,7 +35,7 @@ import {
   type Visit,
 } from './types'
 
-type Section = 'directory' | 'visits' | 'now'
+type Section = 'directory' | 'visits'
 type Theme = 'light' | 'dark'
 const DAILY_CAMP_STORAGE_KEY = 'medrep-daily-camp'
 const DEFAULT_CALL_SCHEDULE = 'Everyday'
@@ -496,9 +494,6 @@ function App() {
             onSavePreset={(name, nextFilters) => void savePreset(name, nextFilters)}
             onDeletePreset={(id) => void deletePreset(id)}
           />
-        ) : section === 'now' ? (
-          <VisitNow doctors={snapshot.doctors} settings={snapshot.master.settings} camp={activeDailyCamp}
-            schedules={filters.callSchedule} onOpen={setSelectedDoctor} onEdit={setEditingDoctor} onLogVisit={logFromDoctor} />
         ) : (
           <Visits
             key={visitsContextVersion}
@@ -514,7 +509,6 @@ function App() {
 
       <nav className="bottom-nav" aria-label="Main navigation">
         <button className={section === 'directory' ? 'active' : ''} onClick={() => selectSection('directory')}><Users size={20} /><span>Directory</span></button>
-        <button className={section === 'now' ? 'active' : ''} onClick={() => selectSection('now')}><Clock3 size={20} /><span>Visit now</span></button>
         <button className={section === 'visits' ? 'active' : ''} onClick={() => selectSection('visits')}><CalendarDays size={20} /><span>Visits</span></button>
       </nav>
 
