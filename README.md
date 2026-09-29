@@ -24,9 +24,11 @@ A mobile-first website for a single medical representative. Bookmark its URL and
 
 Changes are persisted locally and queued in one transaction, then sent immediately
 through the Vercel API. Push and pull share one coordinator (and a Web Lock across
-open tabs). Refresh first drains the queue; if any operation remains, refresh is
-deferred and the UI lists the preserved records. Edits made during refresh are
-queued locally and sent after refresh finishes. Transient failures retry after
+open tabs). Refresh waits for an in-flight write, then reads Sheets before sending
+queued edits. Confirmed doctors missing from the complete response are deleted
+locally. Missing doctors with pending edits stay local until you choose Keep Local
+(restore to Sheets) or Discard. Edits made during refresh are queued locally and
+sent after refresh finishes unless a deletion conflict blocks them. Transient failures retry after
 2 seconds, backing off to 30 seconds, with at most 8 attempts. Tap the cloud icon
 to retry paused transport failures with the same operation IDs.
 The header distinguishes saving to Sheets, refreshing, offline storage, and errors.
@@ -144,8 +146,9 @@ All IndexedDB records carry ISO `updatedAt` and `_synced` metadata. Device-only
 presets, preferences and queue records remain unconfirmed (they are not written
 as records to Sheets). Doctor/visit writes become confirmed only after GAS returns
 a valid server timestamp. Pending successors keep their local version and flag.
-Pull replaces an existing record only when it is confirmed and the Sheet timestamp
-is strictly newer; unsynced and older remote records are listed in the UI.
+Pull mirrors confirmed doctors from the complete Sheets snapshot, including
+deletions, while preserving pending edits. Visit history retains its versioned
+merge behavior. Incomplete or invalid responses cannot delete local data.
 GAS stores versions and content hashes in notes on ID / Visit ID cells, so repeated
 reads do not invent new versions. UpdatedAt and SyncHash columns are not required.
 Visit ID remains stable when rows move or new visits are inserted. To remove the
@@ -153,7 +156,15 @@ legacy columns, deploy the generated GAS bundle as a new web-app version, then r
 `removeSyncColumns` in the Apps Script editor. This preserves existing versions
 and record data before deleting the columns; see [GAS deployment](gas/README.md).
 
-A missing remote row is not a deletion receipt: refresh preserves local records.
-Manual deletion propagation requires explicit tombstones and is outside this
-merge protocol. Offline writes are sent while the website is open or reopened;
+The green Synced indicator requires an empty queue, no unconfirmed records or
+conflicts, and an exact match between local doctor IDs and the last complete
+Sheets response. It describes that snapshot; later Sheet edits require a refresh.
+
+Open Settings (the gear icon) → Clear Local Cache & Refresh to recover the local
+database. This clears all IndexedDB stores, including pending edits and presets,
+and imports a fresh snapshot. It first validates the fresh response; offline or
+failed requests leave the current cache intact. The reset waits for active sync
+operations and blocks saves while it runs. It does not change data in Sheets.
+
+Offline writes are sent while the website is open or reopened;
 there is no operating-system background worker that runs after the app closes.

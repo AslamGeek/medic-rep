@@ -16,7 +16,7 @@ import type {
 
 export type SyncPhase = 'offline' | 'idle' | 'syncing' | 'error'
 
-export interface SyncConflict { entity: 'doctor' | 'visit'; id: string; label: string; reason: string }
+export interface SyncConflict { entity: 'doctor' | 'visit'; id: string; label: string; reason: string; removedFromSheets?: boolean }
 
 export interface SyncDetail {
   phase: SyncPhase
@@ -26,6 +26,7 @@ export interface SyncDetail {
   requiresAttention?: boolean
   retryPaused?: boolean
   conflicts?: SyncConflict[]
+  verified?: boolean
 }
 
 const SYNC_EVENT = 'medrep:sync-status'
@@ -35,6 +36,7 @@ let retryTimer: number | undefined
 let retryDelay = 2_000
 let writeRequested = false
 let refreshing = false
+let resetting = false
 let writeError = ''
 let readError = ''
 let conflicts: SyncConflict[] = []
@@ -48,6 +50,11 @@ async function coordinated<T>(work: () => Promise<T>): Promise<T> {
 
 class ValidationError extends Error {}
 
+function removedConflict(doctor: Doctor): SyncConflict {
+  return { entity: 'doctor', id: doctor.id, label: doctor.name,
+    reason: 'Removed from Sheets — you have unsynced changes', removedFromSheets: true }
+}
+
 function hasRetryableChanges(items: QueueItem[]): boolean {
   const blocked = new Set(items.filter((item) => item.validationError || item.retryStopped).map((item) => item.entityId))
   return items.some((item) => !blocked.has(item.entityId)
@@ -56,18 +63,28 @@ function hasRetryableChanges(items: QueueItem[]): boolean {
 
 async function report(): Promise<void> {
   const items = await db.queue.toArray()
-  const pending = items.length
+  const doctors = await db.doctors.toArray()
+  const visits = await db.visits.toArray()
+  const remoteIds = (await db.meta.get('remoteDoctorIds'))?.value as string[] | undefined
+  const remoteSet = remoteIds ? new Set(remoteIds) : undefined
+  const unsynced = doctors.filter(item => !item._synced).length + visits.filter(item => !item._synced).length
+  const pending = Math.max(items.length, unsynced)
+  const removed = doctors.filter(item => item._removedFromSheets).map(removedConflict)
+  const visibleConflicts = [...conflicts.filter(item => !removed.some(next => next.id === item.id)), ...removed]
+  const verified = Boolean(remoteSet && remoteSet.size === doctors.length && doctors.every(item => remoteSet.has(item.id))
+    && !pending && !visibleConflicts.length)
   const validationError = items.find((item) => item.validationError)?.validationError
   const stopped = items.find(item => item.retryStopped)?.failureMessage
   const message = validationError || stopped || writeError || readError
   emit({
-    phase: !navigator.onLine ? 'offline' : activeWrites || refreshing ? 'syncing' : message ? 'error' : 'idle',
-    activity: activeWrites ? 'saving' : refreshing ? 'refreshing' : undefined,
-    message: message || (pending ? 'Waiting to save to Sheets' : 'Saved to Sheets'),
+    phase: !navigator.onLine ? 'offline' : activeWrites || refreshing || resetting ? 'syncing' : message ? 'error' : 'idle',
+    activity: activeWrites ? 'saving' : refreshing || resetting ? 'refreshing' : undefined,
+    message: message || (pending ? 'Pending changes' : verified ? 'Synced with the last complete Sheets refresh' : 'Refresh to verify Sheets data'),
     pending,
     requiresAttention: Boolean(validationError || stopped),
     retryPaused: Boolean(stopped),
-    conflicts,
+    conflicts: visibleConflicts,
+    verified: verified && !message && !activeWrites && !refreshing && !resetting && navigator.onLine,
   })
 }
 
@@ -144,6 +161,21 @@ async function getBootstrap(): Promise<BootstrapPayload> {
   const data = await fetchJson<BootstrapPayload>(url, { method: 'GET' }, READ_TIMEOUT_MS)
   if (!data.success) throw new Error(data.message || 'Could not load sheet data')
   if (data.schemaVersion !== 2) throw new Error('Deploy the generated Apps Script bundle and run setupSpreadsheet before refreshing.')
+  // Missing/malformed data must never be interpreted as an empty sheet.
+  if (!Array.isArray(data.doctors) || !Array.isArray(data.visits) || !Array.isArray(data.products)
+    || !data.settings || typeof data.settings !== 'object' || !Number.isFinite(Date.parse(data.serverTime))) {
+    throw new ProtocolError('Incomplete Sheets response. Local data was preserved.')
+  }
+  for (const [records, key] of [[data.doctors, 'id'], [data.visits, 'localId']] as const) {
+    const ids = new Set<string>()
+    for (const record of records) {
+      const id = key === 'id' ? (record as Doctor).id : (record as Visit).localId
+      if (typeof id !== 'string' || !id.trim() || ids.has(id) || !Number.isFinite(Date.parse(record.updatedAt))) {
+        throw new ProtocolError('Invalid or duplicate record in Sheets response. Local data was preserved.')
+      }
+      ids.add(id)
+    }
+  }
   return data
 }
 
@@ -189,9 +221,12 @@ export async function queueChange(
   entityId: string,
   payload: QueueItem['payload'],
 ): Promise<string> {
+  if (resetting) throw new Error('Cache refresh is in progress. Save again when it finishes.')
   const opId = crypto.randomUUID()
   await db.transaction('rw', db.queue, db.doctors, db.visits, async () => {
     if (action === 'upsertDoctor') {
+      const existing = await db.doctors.get(entityId)
+      if (existing?._removedFromSheets) payload = { ...payload as Doctor, _removedFromSheets: true }
       const previous = (await db.queue.where('entityId').equals(entityId).toArray())
         .filter((item) => item.action === 'upsertDoctor')
       const rejected = previous.find((item) => item.validationError)
@@ -226,6 +261,10 @@ async function pushQueue(): Promise<void> {
   for (const queued of items) {
     const item = queued.id === undefined ? undefined : await db.queue.get(queued.id)
     if (!item || blockedEntities.has(item.entityId)) continue
+    if (item.action === 'upsertDoctor' && (await db.doctors.get(item.entityId))?._removedFromSheets) {
+      blockedEntities.add(item.entityId)
+      continue
+    }
     if (item.validationError || item.retryStopped) { blockedEntities.add(item.entityId); continue }
     try {
       if (item.action === 'saveVisit') {
@@ -234,6 +273,7 @@ async function pushQueue(): Promise<void> {
         if (pendingDoctors.some((next) => visit.doctorIds.includes(next.entityId))) {
           continue
         }
+        if ((await db.doctors.toArray()).some(doctor => doctor._removedFromSheets && visit.doctorIds.includes(doctor.id))) continue
       }
       const result = await postOperation(item)
       await db.transaction('rw', db.queue, db.doctors, db.visits, async () => {
@@ -281,6 +321,7 @@ async function pushQueue(): Promise<void> {
         }
         if (item.id !== undefined) await db.queue.delete(item.id)
       })
+      conflicts = conflicts.filter(conflict => conflict.id !== item.entityId)
       await report()
     } catch (error) {
       blockedEntities.add(item.entityId)
@@ -308,6 +349,22 @@ async function applyBootstrap(payload: BootstrapPayload): Promise<void> {
   const skipped: SyncConflict[] = []
   await db.transaction('rw', db.queue, db.doctors, db.visits, db.meta, async () => {
     const queued = await db.queue.toArray()
+    const remoteDoctorIds = new Set(payload.doctors.map(doctor => doctor.id))
+    for (const local of await db.doctors.toArray()) {
+      if (remoteDoctorIds.has(local.id)) {
+        if (local._removedFromSheets) await db.doctors.update(local.id, { _removedFromSheets: false })
+        continue
+      }
+      if (local._synced !== true || queued.some(item => item.action === 'upsertDoctor' && item.entityId === local.id)) {
+        // Newly created offline doctors have never been in Sheets.
+        if (!local.isNewRecord) {
+          await db.doctors.update(local.id, { _removedFromSheets: true, _synced: false })
+          skipped.push(removedConflict(local))
+        }
+      } else {
+        await db.doctors.delete(local.id)
+      }
+    }
     // Earlier releases used row-position hashes as IDs. Reconcile only exact,
     // confirmed legacy matches; never delete a pending or unmatched visit.
     const legacyVisits = (await db.visits.toArray()).filter(visit => visit._legacyId && visit._synced
@@ -322,7 +379,7 @@ async function applyBootstrap(payload: BootstrapPayload): Promise<void> {
         await db.visits.put({ ...legacy, localId: remote.localId, _legacyId: false })
       }
     }
-    // Merge, never clear tables. Missing remote rows are not deletion receipts.
+    // Doctors mirror the complete snapshot; pending edits stay local.
     for (const entity of ['doctor', 'visit'] as const) {
       const records = entity === 'doctor' ? payload.doctors : payload.visits
       for (const remote of records) {
@@ -335,7 +392,7 @@ async function applyBootstrap(payload: BootstrapPayload): Promise<void> {
           continue
         }
         if (!Number.isFinite(Date.parse(remote.updatedAt))) throw new Error('Missing server timestamp. Deploy the updated Apps Script.')
-        if (local && Date.parse(remote.updatedAt) <= Date.parse(local.updatedAt)) {
+        if (entity === 'visit' && local && Date.parse(remote.updatedAt) <= Date.parse(local.updatedAt)) {
           if (Date.parse(remote.updatedAt) < Date.parse(local.updatedAt)) skipped.push({ entity, id, label, reason: 'Older Sheets version skipped' })
           continue
         }
@@ -355,41 +412,40 @@ async function applyBootstrap(payload: BootstrapPayload): Promise<void> {
     const updatedAt = payload.serverTime
     await db.meta.put({ key: 'master', value: master, updatedAt, _synced: true })
     await db.meta.put({ key: 'lastSync', value: updatedAt, updatedAt, _synced: false })
+    await db.meta.put({ key: 'remoteDoctorIds', value: [...remoteDoctorIds], updatedAt, _synced: true })
   })
   conflicts = skipped
 }
 
 async function performSync(): Promise<void> {
-  await flushChanges()
-  if (!navigator.onLine) return
+  if (resetting || !navigator.onLine) return report()
   // Take the read gate before checking the queue; edits after this point may be
   // stored locally, but cannot start a network write until the read finishes.
   refreshing = true
   readError = ''
+  let pulled = false
   try {
+    // Finish an already in-flight write, but do not start queued writes before
+    // checking whether Sheets deleted their doctors.
+    if (activeWrites) await activeWrites
     await coordinated(async () => {
-      const pending = await db.queue.toArray()
-      if (pending.length) {
-        conflicts = pending.map(item => ({ entity: item.action === 'upsertDoctor' ? 'doctor' : 'visit', id: item.entityId,
-          label: (item.payload as Doctor).name || item.entityId, reason: item.validationError || 'Unsynced change; refresh deferred' }))
-        readError = 'Refresh deferred: you have unsynced changes.'
-        return
-      }
       await report()
       const bootstrap = await getBootstrap()
       await applyBootstrap(bootstrap)
       await setMeta('lastSuccessfulSync', new Date().toISOString())
+      pulled = true
     })
   } catch (error) {
     readError = error instanceof Error ? error.message : 'Could not refresh from Sheets'
   } finally {
     refreshing = false
     await report()
-    if (writeRequested) await flushChanges()
+    if (pulled && !resetting) await flushChanges()
   }
 }
 
 export function flushChanges(): Promise<void> {
+  if (resetting) return Promise.resolve()
   if (refreshing) { writeRequested = true; return Promise.resolve() }
   if (activeWrites) return activeWrites
   if (retryTimer !== undefined) window.clearTimeout(retryTimer)
@@ -408,7 +464,10 @@ export function flushChanges(): Promise<void> {
   }).finally(async () => {
     activeWrites = null
     await report()
-    if (hasRetryableChanges(await db.queue.toArray()) && navigator.onLine) {
+    const removed = new Set((await db.doctors.toArray()).filter(doctor => doctor._removedFromSheets).map(doctor => doctor.id))
+    const retryable = (await db.queue.toArray()).filter(item => !removed.has(item.entityId)
+      && !(item.action === 'saveVisit' && (item.payload as Visit).doctorIds.some(id => removed.has(id))))
+    if (!refreshing && !resetting && hasRetryableChanges(retryable) && navigator.onLine) {
       retryTimer = window.setTimeout(() => { void flushChanges() }, retryDelay)
       retryDelay = Math.min(retryDelay * 2, 30_000)
     }
@@ -422,6 +481,66 @@ export async function retrySync(): Promise<void> {
     if (item.retryStopped) await db.queue.update(item.id!, { retryStopped: false, attempts: 0, failureMessage: undefined })
   }
   return syncNow()
+}
+
+export async function resolveRemovedDoctor(id: string, choice: 'keep' | 'discard'): Promise<void> {
+  if (resetting) throw new Error('Wait for the cache refresh to finish.')
+  await coordinated(async () => {
+    await db.transaction('rw', db.doctors, db.queue, async () => {
+      const doctor = await db.doctors.get(id)
+      if (!doctor?._removedFromSheets) return
+      for (const item of await db.queue.where('entityId').equals(id).toArray()) {
+        if (item.action === 'upsertDoctor') await db.queue.delete(item.id!)
+      }
+      if (choice === 'discard') {
+        await db.doctors.delete(id)
+      } else {
+        const updatedAt = new Date().toISOString()
+        const payload: Doctor = { ...doctor, _removedFromSheets: false, isNewRecord: false,
+          _synced: false, syncState: 'pending', updatedAt }
+        await db.doctors.put(payload)
+        await db.queue.add({ opId: crypto.randomUUID(), action: 'upsertDoctor', entityId: id,
+          payload, attempts: 0, createdAt: updatedAt, updatedAt, _synced: false })
+      }
+    })
+    conflicts = conflicts.filter(item => item.id !== id)
+    writeError = ''
+  })
+  await report()
+  if (choice === 'keep') await flushChanges()
+}
+
+export async function clearLocalCacheAndRefresh(): Promise<void> {
+  if (resetting) return
+  if (!navigator.onLine) throw new Error('Connect to the internet before clearing the cache.')
+  resetting = true
+  if (retryTimer !== undefined) window.clearTimeout(retryTimer)
+  retryTimer = undefined
+  try {
+    // No old response may repopulate the cache after the reset.
+    if (activeSync) await activeSync
+    if (activeWrites) await activeWrites
+    await report()
+    await coordinated(async () => {
+      // Validate the replacement first so a network error cannot destroy data.
+      const payload = await getBootstrap()
+      await db.transaction('rw', db.doctors, db.visits, db.queue, db.presets, db.meta, async () => {
+        for (const table of [db.doctors, db.visits, db.queue, db.presets, db.meta]) await table.clear()
+        await applyBootstrap(payload)
+      })
+      conflicts = []
+      readError = ''
+      writeError = ''
+      writeRequested = false
+      retryDelay = 2_000
+    })
+  } catch (error) {
+    readError = error instanceof Error ? error.message : 'Could not refresh the cache'
+    throw error
+  } finally {
+    resetting = false
+    await report()
+  }
 }
 
 export function syncNow(): Promise<void> {

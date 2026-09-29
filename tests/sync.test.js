@@ -26,6 +26,7 @@ function table(key) {
     async bulkPut(values) { for (const value of values) await this.put(value) },
     async get(id) { return clone(rows.get(id)) },
     async delete(id) { rows.delete(id) },
+    async clear() { rows.clear() },
     async update(id, changes) { if (rows.has(id)) rows.set(id, { ...rows.get(id), ...clone(changes) }) },
     orderBy: (field) => collection(() => all().sort((a, b) => String(a[field]).localeCompare(String(b[field])))),
     where: (field) => ({ equals: (value) => collection(() => all().filter((row) => row[field] === value)) }),
@@ -39,7 +40,7 @@ const tick = () => new Promise((resolve) => setImmediate(resolve))
 function deferred() { let resolve; const promise = new Promise((r) => { resolve = r }); return { promise, resolve } }
 
 function setup(fetch, options = {}) {
-  const db = options.db || { doctors: table('id'), visits: table('localId'), queue: table('id'), meta: table('key'),
+  const db = options.db || { doctors: table('id'), visits: table('localId'), queue: table('id'), meta: table('key'), presets: table('id'),
     transaction: async (...args) => args.at(-1)() }
   const events = []
   const timers = new Map()
@@ -68,7 +69,187 @@ function setup(fetch, options = {}) {
   return { db, sync: exports, events, timers, navigator }
 }
 
-test('a failed refresh does not prevent an already queued doctor save', async () => {
+test('refresh removes confirmed doctors deleted from Sheets, including an empty sheet', async () => {
+  const { db, sync, events } = setup(async () => response(bootstrap))
+  await db.doctors.put({ ...doctor, _synced: true, syncState: 'synced' })
+  await sync.syncNow()
+  assert.equal(await db.doctors.count(), 0)
+  assert.equal(events.at(-1).verified, true)
+})
+
+test('refresh reads before pushing an offline edit and holds a deleted doctor for a decision', async () => {
+  const methods = []
+  const { db, sync, events, navigator } = setup(async (_url, init) => {
+    methods.push(init.method)
+    return response(init.method === 'GET' ? bootstrap : { success: true, doctor })
+  })
+  navigator.onLine = false
+  await sync.queueChange('upsertDoctor', doctor.id, doctor)
+  navigator.onLine = true
+  await sync.syncNow()
+  assert.deepEqual(methods, ['GET'])
+  assert.equal(await db.queue.count(), 1)
+  assert.equal((await db.doctors.get(doctor.id))._synced, false)
+  assert.equal(events.at(-1).verified, false)
+  assert.ok(events.at(-1).conflicts.some(item => item.id === doctor.id && item.removedFromSheets))
+})
+
+test('Keep Local restores the latest edit with a new operation; Discard removes only that doctor and its saves', async () => {
+  for (const choice of ['keep', 'discard']) {
+    const posted = []
+    const { db, sync, navigator, events } = setup(async (_url, init) => {
+      if (init.method === 'GET') return response(bootstrap)
+      const operation = JSON.parse(init.body)
+      posted.push(operation)
+      return response({ success: true, doctor: { ...operation.payload, updatedAt: '2026-09-30T00:00:00.000Z' } })
+    })
+    navigator.onLine = false
+    const oldOp = await sync.queueChange('upsertDoctor', doctor.id, { ...doctor, name: 'Local correction' })
+    await db.visits.put({ localId: 'history', _synced: true })
+    navigator.onLine = true
+    await sync.syncNow()
+    await sync.flushChanges()
+    assert.equal(posted.length, 0)
+    await sync.resolveRemovedDoctor(doctor.id, choice)
+    assert.equal(await db.queue.count(), 0)
+    assert.ok(await db.visits.get('history'))
+    if (choice === 'keep') {
+      assert.equal(posted.length, 1)
+      assert.notEqual(posted[0].opId, oldOp)
+      assert.equal(posted[0].payload.isNewRecord, false)
+      assert.equal((await db.doctors.get(doctor.id)).name, 'Local correction')
+      assert.equal((await db.doctors.get(doctor.id))._synced, true)
+      assert.equal(events.at(-1).verified, false, 'Restoration needs a complete pull before ID parity can be claimed')
+    } else {
+      assert.equal(posted.length, 0)
+      assert.equal(await db.doctors.get(doctor.id), undefined)
+      assert.equal(events.at(-1).verified, true)
+    }
+  }
+})
+
+test('deleted-doctor conflict survives reopening and an unrelated local edit cannot bypass it', async () => {
+  const first = setup(async () => response(bootstrap))
+  await first.db.doctors.put({ ...doctor, _synced: false })
+  await first.sync.syncNow()
+  let posts = 0
+  const second = setup(async (_url, init) => {
+    if (init.method === 'POST') posts++
+    return response(bootstrap)
+  }, { db: first.db })
+  await second.sync.queueChange('upsertDoctor', doctor.id, { ...doctor, name: 'Another edit' })
+  await second.sync.flushChanges()
+  assert.equal(posts, 0)
+  assert.ok(second.events.at(-1).conflicts.some(item => item.removedFromSheets))
+})
+
+test('new offline doctors are queued for creation instead of being treated as deleted', async () => {
+  const posted = []
+  const { db, sync, navigator } = setup(async (_url, init) => {
+    if (init.method === 'GET') return response(bootstrap)
+    posted.push(JSON.parse(init.body))
+    return response({ success: true, doctor })
+  })
+  navigator.onLine = false
+  await sync.queueChange('upsertDoctor', 'local-new', { ...doctor, id: 'local-new', isNewRecord: true })
+  navigator.onLine = true
+  await sync.syncNow()
+  assert.equal(posted.length, 1)
+  assert.equal(await db.queue.count(), 0)
+  assert.equal((await db.doctors.get(doctor.id))._synced, true)
+})
+
+test('incomplete, duplicate and invalid snapshots never delete local doctors', async () => {
+  for (const invalid of [{ ...bootstrap, doctors: undefined }, { ...bootstrap, doctors: [doctor, doctor] },
+    { ...bootstrap, doctors: [{ ...doctor, updatedAt: '' }] }]) {
+    const { db, sync, events } = setup(async () => response(invalid))
+    await db.doctors.put(doctor)
+    await sync.syncNow()
+    assert.equal(await db.doctors.count(), 1)
+    assert.equal(events.at(-1).phase, 'error')
+    assert.equal(events.at(-1).verified, false)
+  }
+})
+
+test('HTTP success on a save does not claim verified parity before a complete refresh', async () => {
+  const { sync, events } = setup(async () => response({ success: true, doctor }))
+  await sync.queueChange('upsertDoctor', doctor.id, doctor)
+  await sync.flushChanges()
+  assert.equal(events.at(-1).pending, 0)
+  assert.equal(events.at(-1).verified, false)
+})
+
+test('cache reset clears every store and replaces records from a validated fresh pull', async () => {
+  const methods = []
+  const { db, sync, events } = setup(async (_url, init) => {
+    methods.push(init.method)
+    return response({ ...bootstrap, doctors: [doctor] })
+  })
+  await db.doctors.put({ ...doctor, id: 'stale' })
+  await db.queue.add({ action: 'upsertDoctor', entityId: 'stale', payload: doctor })
+  await db.visits.put({ localId: 'old-visit' })
+  await db.presets.put({ id: 'preset' })
+  await db.meta.put({ key: 'old-preference', value: true })
+  await sync.clearLocalCacheAndRefresh()
+  assert.deepEqual(methods, ['GET'])
+  assert.equal(await db.doctors.count(), 1)
+  assert.equal(await db.doctors.get('stale'), undefined)
+  assert.equal(await db.queue.count(), 0)
+  assert.equal(await db.visits.count(), 0)
+  assert.equal(await db.presets.count(), 0)
+  assert.equal(await db.meta.get('old-preference'), undefined)
+  assert.equal(events.at(-1).verified, true)
+})
+
+test('failed reset keeps cached records and queued edits, and reports failure', async () => {
+  const { db, sync, events } = setup(async () => { throw new TypeError('fetch failed') })
+  await db.doctors.put(doctor)
+  await db.queue.add({ action: 'upsertDoctor', entityId: doctor.id, payload: doctor })
+  await assert.rejects(sync.clearLocalCacheAndRefresh(), /fetch failed/)
+  assert.equal(await db.doctors.count(), 1)
+  assert.equal(await db.queue.count(), 1)
+  assert.equal(events.at(-1).phase, 'error')
+})
+
+test('reset waits for an older refresh and blocks new saves until the replacement is installed', async () => {
+  const oldRead = deferred()
+  let reads = 0
+  const { db, sync } = setup(async () => {
+    reads++
+    return reads === 1 ? oldRead.promise : response(bootstrap)
+  })
+  const refresh = sync.syncNow()
+  await tick()
+  const reset = sync.clearLocalCacheAndRefresh()
+  await assert.rejects(sync.queueChange('upsertDoctor', doctor.id, doctor), /Cache refresh is in progress/)
+  oldRead.resolve(response({ ...bootstrap, doctors: [doctor] }))
+  await Promise.all([refresh, reset])
+  assert.equal(reads, 2)
+  assert.equal(await db.doctors.count(), 0)
+  assert.equal(await db.queue.count(), 0)
+})
+
+test('a local edit made during a pull is kept when its doctor is missing from the response', async () => {
+  const read = deferred()
+  let posts = 0
+  const { db, sync, events } = setup(async (_url, init) => {
+    if (init.method === 'GET') return read.promise
+    posts++
+    return response({ success: true, doctor })
+  })
+  await db.doctors.put(doctor)
+  const refresh = sync.syncNow()
+  await tick()
+  await sync.queueChange('upsertDoctor', doctor.id, { ...doctor, name: 'Edited during refresh' })
+  read.resolve(response(bootstrap))
+  await refresh
+  assert.equal(posts, 0)
+  assert.equal((await db.doctors.get(doctor.id)).name, 'Edited during refresh')
+  assert.equal(events.at(-1).verified, false)
+  assert.ok(events.at(-1).conflicts.some(item => item.removedFromSheets))
+})
+
+test('a failed refresh preserves queued edits without resurrecting an unverified doctor', async () => {
   const calls = []
   const { db, sync } = setup(async (_url, init) => {
     calls.push(init.method)
@@ -78,8 +259,8 @@ test('a failed refresh does not prevent an already queued doctor save', async ()
   await db.doctors.put(doctor)
   await db.queue.add({ opId: 'op-1', action: 'upsertDoctor', entityId: doctor.id, payload: doctor, attempts: 0, createdAt: '1' })
   await sync.syncNow()
-  assert.ok(calls.includes('POST'), 'A failing Sheets read blocked the save request')
-  assert.equal(await db.queue.count(), 0)
+  assert.deepEqual(calls, ['GET'])
+  assert.equal(await db.queue.count(), 1)
 })
 
 test('queued doctor edits from the retired feature can sync without call windows in the response', async () => {
@@ -116,13 +297,13 @@ test('an edit waits until the active refresh finishes before pushing', async () 
   }
 })
 
-test('pull preserves a newer confirmed local record', async () => {
+test('pull mirrors confirmed doctor content even when the cached timestamp is ahead', async () => {
   const { db, sync } = setup(async () => response({ ...bootstrap,
     doctors: [{ ...doctor, name: 'Stale sheet', updatedAt: '2026-09-01T00:00:00.000Z' }],
   }))
   await db.doctors.put({ ...doctor, _synced: true, syncState: 'synced', updatedAt: '2026-09-02T00:00:00.000Z' })
   await sync.syncNow()
-  assert.equal((await db.doctors.get(doctor.id)).name, doctor.name)
+  assert.equal((await db.doctors.get(doctor.id)).name, 'Stale sheet')
 })
 
 test('pull preserves and reports an unsynced record even without a queue entry', async () => {
@@ -311,7 +492,7 @@ test('offline edits persist and become confirmed on reconnection', async () => {
   assert.equal(await db.queue.count(), 0)
 })
 
-test('refresh defers while a failed write remains queued', async () => {
+test('refresh can fail independently while preserving a failed queued write', async () => {
   const methods = []
   const { db, sync, events } = setup(async (_url, init) => {
     methods.push(init.method)
@@ -319,14 +500,15 @@ test('refresh defers while a failed write remains queued', async () => {
   })
   await sync.queueChange('upsertDoctor', doctor.id, doctor)
   await sync.syncNow()
-  assert.deepEqual(methods, ['POST'])
+  assert.deepEqual(methods, ['POST', 'GET'])
   assert.equal(await db.queue.count(), 1)
-  assert.ok(events.at(-1).conflicts.some(item => item.id === doctor.id))
+  assert.equal(events.at(-1).verified, false)
 })
 
 test('refresh never retries master-list validation failures', async () => {
   let calls = 0
-  const { db, sync, timers } = setup(async () => {
+  const { db, sync, timers } = setup(async (_url, init) => {
+    if (init.method === 'GET') return response({ ...bootstrap, doctors: [doctor] })
     calls++
     return response({ success: false, message: 'Area must come from the spreadsheet master list.' })
   })
@@ -342,7 +524,7 @@ test('refresh never retries master-list validation failures', async () => {
 test('transient retries stop after eight attempts and manual retry preserves the operation ID', async () => {
   const posted = []
   const { db, sync, timers } = setup(async (_url, init) => {
-    if (init.method === 'GET') return response(bootstrap)
+    if (init.method === 'GET') return response({ ...bootstrap, doctors: [doctor] })
     posted.push(JSON.parse(init.body).opId)
     if (posted.length <= 8) throw new TypeError('fetch failed')
     return response({ success: true, doctor })

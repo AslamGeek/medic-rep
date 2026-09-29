@@ -10,6 +10,7 @@ export interface RecordSync {
 export interface Doctor extends RecordSync {
   id: string
   isNewRecord?: boolean
+  _removedFromSheets?: boolean
   name: string
   specialties: string[]
   hospital: string

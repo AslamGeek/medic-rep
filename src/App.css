@@ -111,6 +111,8 @@
 }
 
 .sync-badge:disabled { cursor: wait; }
+.sync-badge.pending { color: var(--muted); background: var(--surface-soft); }
+.conflict-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
 
 .sync-badge.error,
 .sync-badge.offline {

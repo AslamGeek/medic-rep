@@ -1,16 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   CalendarDays,
-  Check,
   CloudOff,
   MapPin,
   Moon,
   Plus,
-  RefreshCw,
   Stethoscope,
   Sun,
+  Settings,
   Users,
-  WifiOff,
   X,
 } from 'lucide-react'
 import './App.css'
@@ -23,7 +21,9 @@ import { Directory } from './components/Directory'
 import { DoctorDetail } from './components/DoctorDetail'
 import { DoctorForm } from './components/DoctorForm'
 import { Visits } from './components/Visits'
-import { onSyncStatus, queueChange, syncNow, retrySync, type SyncDetail } from './sync'
+import { SyncStatus } from './components/SyncStatus'
+import { AboutPage } from './settings/AboutPage'
+import { onSyncStatus, queueChange, syncNow, retrySync, resolveRemovedDoctor, clearLocalCacheAndRefresh, type SyncDetail } from './sync'
 import { dayName, formatDate, localDateString, normalize } from './utils'
 import {
   EMPTY_FILTERS,
@@ -87,34 +87,6 @@ const EMPTY_SNAPSHOT: AppSnapshot = {
   pendingCount: 0,
 }
 
-function SyncBadge({
-  detail,
-  onRetry,
-}: {
-  detail: SyncDetail
-  onRetry: () => void
-}) {
-  const content = (() => {
-    if (detail.phase === 'offline') return { icon: <WifiOff size={13} />, label: detail.pending ? `${detail.pending} offline` : 'Offline' }
-    if (detail.phase === 'syncing') return { icon: <RefreshCw className="spin" size={13} />, label: detail.activity === 'saving' ? 'Saving to Sheets' : 'Refreshing' }
-    if (detail.phase === 'error') return { icon: <CloudOff size={13} />, label: detail.pending ? `${detail.pending} pending` : 'Refresh failed' }
-    if (detail.pending) return { icon: <RefreshCw size={13} />, label: `${detail.pending} queued` }
-    return { icon: <Check size={13} />, label: 'Saved to Sheets' }
-  })()
-  return (
-    <button
-      type="button"
-      className={`sync-badge ${detail.phase}`}
-      title={detail.message || 'Sync with Google Sheets'}
-      aria-label={`${content.label}. Tap to sync with Google Sheets.`}
-      disabled={detail.phase === 'syncing'}
-      onClick={onRetry}
-    >
-      {content.icon}<span>{content.label}</span>
-    </button>
-  )
-}
-
 function Toast({ toast, onClose }: { toast: ToastState; onClose: () => void }) {
   useEffect(() => {
     const timer = window.setTimeout(onClose, toast.durationMs ?? UNDO_WINDOW_MS)
@@ -130,6 +102,8 @@ function Toast({ toast, onClose }: { toast: ToastState; onClose: () => void }) {
 }
 
 function App() {
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [resolving, setResolving] = useState<string | null>(null)
   const [section, setSection] = useState<Section>('directory')
   const [barsHidden, setBarsHidden] = useState(false)
   const lastScrollY = useRef(0)
@@ -160,6 +134,7 @@ function App() {
 
   const acceptSnapshot = useCallback((data: AppSnapshot) => {
     setSnapshot(data)
+    setSelectedDoctor(current => current ? data.doctors.find(doctor => doctor.id === current.id) || null : null)
     const firstCamp = data.master.settings.camps[0]
     if (!dailyCampInitialized.current && firstCamp) {
       dailyCampInitialized.current = true
@@ -274,6 +249,27 @@ function App() {
     setToast({ ...next, id: crypto.randomUUID() })
   }, [])
 
+  const resolveConflict = async (id: string, choice: 'keep' | 'discard') => {
+    setResolving(id)
+    try { await resolveRemovedDoctor(id, choice); await reload() }
+    catch (error) { showToast({ message: error instanceof Error ? error.message : 'Could not resolve this record' }) }
+    finally { setResolving(null) }
+  }
+
+  const resetCache = async () => {
+    await clearLocalCacheAndRefresh()
+    setSelectedDoctor(null)
+    setEditingDoctor(undefined)
+    setToast(null)
+    setFocusDoctorId(null)
+    setFilters(structuredClone(EMPTY_FILTERS))
+    setDailyCamp('')
+    saveDailyCamp('')
+    dailyCampInitialized.current = false
+    setVisitsContextVersion(current => current + 1)
+    await reload()
+  }
+
   const saveDoctor = async (doctor: Doctor) => {
     await queueChange('upsertDoctor', doctor.id, doctor)
     await reload()
@@ -372,10 +368,11 @@ function App() {
           <div><p className="eyebrow">Field companion</p><h1>{APP_NAME}</h1></div>
         </div>
         <div className="header-actions">
-          <SyncBadge
+          <SyncStatus
             detail={syncDetail}
             onRetry={() => void retrySync().then(reload)}
           />
+          <button className="icon-button" onClick={() => setSettingsOpen(true)} aria-label="Settings"><Settings size={19} /></button>
           <button className="icon-button" onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')} aria-label={`Use ${theme === 'light' ? 'dark' : 'light'} theme`}>
             {theme === 'light' ? <Moon size={19} /> : <Sun size={19} />}
           </button>
@@ -406,7 +403,13 @@ function App() {
       {Boolean(syncDetail.conflicts?.length) && (
         <div className="setup-banner" role="status">
           <div><strong>Local changes preserved</strong><ul>
-            {syncDetail.conflicts?.map((item, index) => <li key={item.entity + item.id + index}>{item.label}: {item.reason}</li>)}
+            {syncDetail.conflicts?.map((item, index) => <li key={item.entity + item.id + index}>
+              {item.label}: {item.reason}
+              {item.removedFromSheets && <div className="conflict-actions">
+                <button className="choice-chip" disabled={resolving !== null} onClick={() => void resolveConflict(item.id, 'keep')}>Keep Local</button>
+                <button className="choice-chip" disabled={resolving !== null} onClick={() => void resolveConflict(item.id, 'discard')}>Discard</button>
+              </div>}
+            </li>)}
           </ul></div>
         </div>
       )}
@@ -510,6 +513,7 @@ function App() {
           onLogVisit={logFromDoctor}
         />
       )}
+      {settingsOpen && <AboutPage onClose={() => setSettingsOpen(false)} onReset={resetCache} />}
       {toast && <Toast toast={toast} onClose={() => setToast(null)} />}
     </div>
   )
