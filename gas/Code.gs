@@ -23,18 +23,17 @@ var SHEET_HEADERS = {
   Doctors: [
     'ID', 'Name', 'Specialties', 'Hospital', 'Pharmacy', 'Area', 'Camp',
     'Potential', 'Stockist', 'Prescriber', 'OP Timing', 'Call Schedule',
-    'Prescribing Products', 'Notes', 'UpdatedAt', 'SyncHash'
+    'Prescribing Products', 'Notes'
   ],
   Visits: [
     'Date', 'Day', 'Camp', 'Doctors (count)', 'Pharmacy (count)',
-    'Doctors', 'Pharmacy', 'Visit ID', 'Doctor IDs', 'UpdatedAt', 'SyncHash'
+    'Doctors', 'Pharmacy', 'Visit ID', 'Doctor IDs'
   ],
   Settings: [
     'Areas', 'Specialties', 'Camps', 'Potentials', 'Stockist',
     'OP Timings', 'Call Schedule'
   ],
-  Products: ['ProdID', 'Name', 'DosageForm'],
-  DoctorAvailability: ['Doctor ID', 'Days', 'From', 'Until', 'Notes']
+  Products: ['ProdID', 'Name', 'DosageForm']
 };
 
 var HEADER_ALIASES = {
@@ -162,6 +161,23 @@ function spreadsheet_() {
   return ACTIVE_SPREADSHEET_;
 }
 
+/** One-time cleanup: deploy this version before removing the obsolete tab. */
+function removeDoctorAvailability() {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    var ss = spreadsheet_();
+    // Validate the four retained tabs before removing anything.
+    health_();
+    var obsolete = ss.getSheetByName('DoctorAvailability');
+    if (obsolete) ss.deleteSheet(obsolete);
+    SpreadsheetApp.flush();
+    return 'DoctorAvailability removed. Doctors, Visits, Settings and Products retained.';
+  } finally {
+    lock.releaseLock();
+  }
+}
+
 function sheet_(name) {
   var sheet = spreadsheet_().getSheetByName(name);
   if (!sheet) throw new Error('Missing ' + name + ' sheet. Run setupSpreadsheet once.');
@@ -187,7 +203,7 @@ function ensureSheet_(ss, name, expectedHeaders) {
   var headers = readHeaders_(sheet);
   expectedHeaders.forEach(function (header) {
     // Append only new sync columns; canonicalize recognized legacy header names.
-    if (['UpdatedAt', 'SyncHash', 'Visit ID', 'Doctor IDs'].indexOf(header) !== -1 && headers.indexOf(header) === -1) {
+    if (['Visit ID', 'Doctor IDs'].indexOf(header) !== -1 && headers.indexOf(header) === -1) {
       headers.push(header);
       sheet.getRange(1, headers.length).setValues([[header]]);
     } else {
@@ -553,7 +569,7 @@ function doctorFromRow_(headers, row, products) {
     callSchedule: cleanText_(valueAt_(headers, row, 'Call Schedule'), 120),
     prescribingProductIds: productIdsFromCell_(valueAt_(headers, row, 'Prescribing Products'), products),
     notes: cleanText_(valueAt_(headers, row, 'Notes'), 500),
-    updatedAt: isoTimestamp_(valueAt_(headers, row, 'UpdatedAt')),
+    updatedAt: '',
     _synced: true,
     syncState: 'synced'
   };
@@ -564,44 +580,14 @@ function getDoctors_(products) {
   var rows = sheet.getDataRange().getValues();
   var headers = rows.shift().map(function (value) { return String(value).trim(); });
   products = products || getProducts_();
-  var availability = getDoctorAvailability_();
+  var notes = recordNotes_(sheet, headers, rows.length, 'ID');
   return rows
     .map(function (row, index) {
       var doctor = doctorFromRow_(headers, row, products);
       if (!doctor) return null;
-      doctor.availability = availability[doctor.id] || [];
-      stampRecord_(sheet, headers, row, index + 2, doctor);
+      stampRecord_(sheet, headers, row, index + 2, doctor, notes[index][0]);
       return doctor;
     }).filter(Boolean);
-}
-
-function getDoctorAvailability_() {
-  var sheet = spreadsheet_().getSheetByName('DoctorAvailability');
-  if (!sheet) throw new Error('Missing DoctorAvailability sheet. Run setupSpreadsheet once.');
-  var rows = sheet.getDataRange().getDisplayValues();
-  var headers = rows.shift();
-  SHEET_HEADERS.DoctorAvailability.forEach(function (name) { columnIndex_(headers, name); });
-  return availabilityFromRecords(rows.map(function (row) {
-    var record = {};
-    SHEET_HEADERS.DoctorAvailability.forEach(function (name) { record[name] = valueAt_(headers, row, name); });
-    return record;
-  }));
-}
-
-function saveDoctorAvailability_(id, windows) {
-  var sheet = sheet_('DoctorAvailability');
-  var headers = readHeaders_(sheet);
-  var rows = sheet.getDataRange().getValues();
-  var idColumn = columnIndex_(headers, 'Doctor ID');
-  for (var index = rows.length - 1; index >= 1; index--) {
-    if (cleanText_(rows[index][idColumn], 120) === id) sheet.deleteRow(index + 1);
-  }
-  windows.forEach(function (window) {
-    var row = new Array(headers.length).fill('');
-    var values = { 'Doctor ID': id, Days: window.days.join(', '), From: window.from, Until: window.until, Notes: window.notes };
-    Object.keys(values).forEach(function (key) { row[columnIndex_(headers, key)] = values[key]; });
-    sheet.appendRow(row);
-  });
 }
 
 function validateChoice_(label, value, allowed, optional) {
@@ -643,7 +629,6 @@ function validateDoctor_(input, products) {
   };
 
   if (!doctor.id || !doctor.name) throw new Error('Doctor ID and name are required.');
-  if (input.availability !== undefined) doctor.availability = validateAvailability(input.availability);
   return doctor;
 }
 
@@ -664,9 +649,7 @@ function doctorCellValue_(doctor, canonical, products) {
     'Prescribing Products': doctor.prescribingProductIds.map(function (id) {
       return productLabel_(products.filter(function (product) { return product.prodId === id; })[0]);
     }).join(', '),
-    'Notes': doctor.notes,
-    'UpdatedAt': doctor.updatedAt,
-    'SyncHash': ''
+    'Notes': doctor.notes
   };
   return map[canonical];
 }
@@ -703,10 +686,6 @@ function upsertDoctor_(input, lockHeld) {
   if (!lockHeld) lock.waitLock(20000);
   try {
     var sheet = sheet_('Doctors');
-    if (doctor.availability !== undefined) {
-      var availabilityHeaders = readHeaders_(sheet_('DoctorAvailability'));
-      SHEET_HEADERS.DoctorAvailability.forEach(function (name) { columnIndex_(availabilityHeaders, name); });
-    }
     var rows = sheet.getDataRange().getValues();
     var headers = rows.shift().map(function (value) { return String(value).trim(); });
     var idIndex = columnIndex_(headers, 'ID');
@@ -732,22 +711,16 @@ function upsertDoctor_(input, lockHeld) {
       ? rows[rowNumber - 2].slice()
       : new Array(headers.length).fill('');
 
-    doctor.updatedAt = new Date(Math.max(Date.now(),
-      (Date.parse(valueAt_(headers, existingRow, 'UpdatedAt')) || 0) + 1)).toISOString();
-
     SHEET_HEADERS.Doctors.forEach(function (canonical) {
       existingRow[columnIndex_(headers, canonical)] = doctorCellValue_(doctor, canonical, products);
     });
 
-    // Write windows first: a retried creation reuses the same next ID until the
-    // doctor row is committed. Old clients omit this field and retain windows.
-    if (doctor.availability !== undefined) saveDoctorAvailability_(doctor.id, doctor.availability);
-    else doctor.availability = getDoctorAvailability_()[doctor.id] || [];
     if (rowNumber > 0) {
       sheet.getRange(rowNumber, 1, 1, headers.length).setValues([existingRow]);
     } else {
       sheet.appendRow(existingRow);
     }
+    stampRecord_(sheet, headers, existingRow, rowNumber > 0 ? rowNumber : sheet.getLastRow(), doctor, undefined, true);
     sortDoctorRows_(sheet);
     return { doctor: getDoctors_(products).filter(function (item) { return item.id === doctor.id; })[0] };
   } finally {
@@ -815,7 +788,6 @@ function saveVisit_(input, lockHeld) {
     var row = new Array(headers.length).fill('');
     row[columnIndex_(headers, 'Visit ID')] = visitId;
     row[columnIndex_(headers, 'Doctor IDs')] = doctorIds.join(', ');
-    row[columnIndex_(headers, 'UpdatedAt')] = new Date().toISOString();
     row[columnIndex_(headers, 'Date')] = date;
     row[columnIndex_(headers, 'Day')] = visitDay_(date);
     row[columnIndex_(headers, 'Camp')] = camp;
@@ -893,7 +865,7 @@ function visitFromRow_(headers, row) {
     doctorLines: doctorLines,
     pharmacyLines: pharmacyLines,
     createdAt: date ? date + 'T00:00:00.000Z' : new Date().toISOString(),
-    updatedAt: isoTimestamp_(valueAt_(headers, row, 'UpdatedAt')),
+    updatedAt: '',
     _synced: true,
     syncState: 'synced'
   };
@@ -903,6 +875,7 @@ function getVisits_() {
   var sheet = sheet_('Visits');
   var rows = sheet.getDataRange().getValues();
   var headers = rows.shift().map(function (value) { return String(value).trim(); });
+  var notes = recordNotes_(sheet, headers, rows.length, 'Visit ID');
   return rows.map(function (row, index) {
     if (!valueAt_(headers, row, 'Date')) return null;
     var idColumn = columnIndex_(headers, 'Visit ID');
@@ -911,7 +884,7 @@ function getVisits_() {
       sheet.getRange(index + 2, idColumn + 1).setValues([[row[idColumn]]]);
     }
     var visit = visitFromRow_(headers, row, index + 2);
-    stampRecord_(sheet, headers, row, index + 2, visit);
+    stampRecord_(sheet, headers, row, index + 2, visit, notes[index][0]);
     return visit;
   }).filter(Boolean)
     .filter(function (visit) { return visit.date; })
@@ -969,24 +942,69 @@ function rememberOperation_(opId, result) {
 
 
 // Stable versions also detect direct Sheet edits, pasted ranges, scripts and
-// availability changes. Reads advance a version only when content has changed.
+// other changes. Reads advance a version only when content has changed.
 function isoTimestamp_(value) {
   var millis = new Date(value).getTime();
   return isFinite(millis) ? new Date(millis).toISOString() : '';
 }
 
-function stampRecord_(sheet, headers, row, rowNumber, record) {
+// Keep sync metadata with the row, preserving user-written ID-cell notes.
+var SYNC_NOTE_PATTERN_ = /^MedRep sync: (.+)$/m;
+
+function recordNotes_(sheet, headers, count, idHeader) {
+  return count ? sheet.getRange(2, columnIndex_(headers, idHeader) + 1, count, 1).getNotes() : [];
+}
+
+function stampRecord_(sheet, headers, row, rowNumber, record, note, force) {
+  var id = record.id || record.localId;
+  var cell = sheet.getRange(rowNumber, columnIndex_(headers, record.id ? 'ID' : 'Visit ID') + 1);
+  if (note === undefined) note = cell.getNote();
+  var match = note.match(SYNC_NOTE_PATTERN_);
+  var metadata = null;
+  if (match) {
+    try { metadata = JSON.parse(match[1]); } catch (ignored) {}
+  }
+  if (!metadata || metadata.id !== id) metadata = null;
+  // Read legacy columns only until metadata has been migrated to a note.
+  var versionColumn = headers.indexOf('UpdatedAt');
+  var hashColumn = headers.indexOf('SyncHash');
+  var previousVersion = isoTimestamp_(metadata ? metadata.updatedAt : versionColumn >= 0 ? row[versionColumn] : '');
+  var previousHash = metadata ? metadata.hash : hashColumn >= 0 ? row[hashColumn] : '';
   var content = Object.assign({}, record);
   delete content.updatedAt;
   delete content._synced;
   delete content.syncState;
   var hash = Utilities.base64EncodeWebSafe(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, JSON.stringify(content)));
-  var hashColumn = columnIndex_(headers, 'SyncHash');
-  var versionColumn = columnIndex_(headers, 'UpdatedAt');
-  if (row[hashColumn] !== hash || !record.updatedAt) {
-    record.updatedAt = new Date(Math.max(Date.now(), (Date.parse(record.updatedAt) || 0) + 1)).toISOString();
-    sheet.getRange(rowNumber, versionColumn + 1).setValues([[record.updatedAt]]);
-    sheet.getRange(rowNumber, hashColumn + 1).setValues([[hash]]);
+  record.updatedAt = previousVersion;
+  if (force || previousHash !== hash || !previousVersion) {
+    record.updatedAt = new Date(Math.max(Date.now(), (Date.parse(previousVersion) || 0) + 1)).toISOString();
+  }
+  if (!metadata || metadata.hash !== hash || metadata.updatedAt !== record.updatedAt) {
+    var line = 'MedRep sync: ' + JSON.stringify({ id: id, updatedAt: record.updatedAt, hash: hash });
+    cell.setNote(match ? note.replace(SYNC_NOTE_PATTERN_, function () { return line; }) : note + (note ? '\n' : '') + line);
+  }
+}
+
+/** Run AFTER deploying this version. Safe to repeat after a partial migration. */
+function removeSyncColumns() {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    // Persist all metadata before deleting either tab's old columns.
+    getDoctors_();
+    getVisits_();
+    SpreadsheetApp.flush();
+    ['Doctors', 'Visits'].forEach(function (name) {
+      var sheet = sheet_(name);
+      var headers = readHeaders_(sheet);
+      for (var index = headers.length - 1; index >= 0; index--) {
+        if (headers[index] === 'UpdatedAt' || headers[index] === 'SyncHash') sheet.deleteColumn(index + 1);
+      }
+    });
+    SpreadsheetApp.flush();
+    return 'UpdatedAt and SyncHash removed. Sync metadata preserved in ID-cell notes.';
+  } finally {
+    lock.releaseLock();
   }
 }
 
@@ -998,7 +1016,5 @@ function health_() {
     if (missing.length) throw new Error(name + ': missing exact headers ' + missing.join(', '));
     tabs[name] = headers;
   });
-  var availability = getDoctorAvailability_();
-  Object.keys(availability).forEach(function (id) { validateAvailability(availability[id]); });
-  return { success: true, schemaVersion: 2, spreadsheetId: CONFIG.SPREADSHEET_ID, tabs: tabs, availabilityValid: true };
+  return { success: true, schemaVersion: 2, spreadsheetId: CONFIG.SPREADSHEET_ID, tabs: tabs };
 }

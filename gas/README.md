@@ -2,40 +2,47 @@
 
 1. From the repository root run `npm run build:gas` (also part of `npm run build`).
 2. Replace the Apps Script project's `Code.gs` with **`gas/dist/Code.gs`**.
-   `gas/Code.gs` is source only and deliberately does not contain the parser.
+   The build prepares the deployable script from `gas/Code.gs`.
 3. Run **setupSpreadsheet** again. It creates missing tabs, canonicalizes legacy
-   headers, appends `UpdatedAt` / `SyncHash` and visit identity columns, and
+   headers, appends missing visit identity columns, and
    initializes existing record versions without clearing records.
 4. **Deploy → Manage deployments → Edit → New version → Deploy**.
    Confirm **Execute as: Me** and **Who has access: Anyone**. Keep the deployment URL.
 5. Match Vercel `GAS_WEB_APP_URL` and local `.env` `VITE_GAS_WEB_APP_URL` (or the
    shared default imported by `vite.config.ts`). Deploy the matching frontend/API.
 6. Run `npm run check:deployment`. The `/exec?action=health` and
-   `/api/sync?action=health` responses must contain `schemaVersion: 2`, all five
-   exact header sets, and `availabilityValid: true`.
+   `/api/sync?action=health` responses must contain `schemaVersion: 2`, the four
+   exact header sets: Doctors, Visits, Settings and Products.
 
 Both reads and writes now go through the same Apps Script deployment. A Google
 CSV endpoint is used only by the read-only deployment diagnostic, never app sync.
 See the repository README for the exact header checklist and smoke tests.
 
-## Parser source
+## Remove the retired tab
 
-Edit only `shared/availability.js`, then rebuild. Never manually copy parser
-logic into this source or the generated artifact. `npm test` executes the
-same cases against the browser module and generated Apps Script bundle.
-
-DoctorAvailability has one window per row, with headers `Doctor ID`, `Days`,
-`From`, `Until`, `Notes`. Use `Mon, Wed` and `HH:mm` 24-hour times; Until can be
-blank, otherwise it must follow From on the same day.
+Deploy the generated script as a **new version of the existing web app**, then
+run **removeDoctorAvailability** in the Apps Script editor. This deletes the old
+DoctorAvailability tab and its call-window data. It leaves the four supported
+tabs intact and is safe to run again. Setup no longer creates the retired tab.
+Redeploy the frontend to remove the call-window editor and profile display.
+OP Timing and Call Schedule remain supported doctor fields.
 
 ## Versioning and retries
 
-Doctor/visit records store UpdatedAt and a content hash in the sheet. Bootstrap
+To remove existing `UpdatedAt` and `SyncHash` columns, build and replace Code.gs,
+then **deploy a new version of the existing web app first**. After deployment,
+run **removeSyncColumns** once in the Apps Script editor. It migrates existing
+versions into ID-cell notes before deleting those two columns from Doctors and
+Visits. It preserves records, custom columns, and existing note text, and can be
+run again safely. Do not delete the columns while the older deployment is active.
+New spreadsheets and later setup runs do not add these columns.
+
+Doctor/visit records store timestamps and content hashes in notes on ID / Visit ID cells. Bootstrap
 uses a script lock shared with writes and updates versions only for changed
-content, including availability edits. This detects manual edits, pasted ranges,
+record content. This detects manual edits, pasted ranges,
 and edits made by other scripts without requiring an onEdit trigger. Visit IDs
 remain stable through row insertion and sorting; old rows receive IDs during setup.
-Do not edit the sync metadata columns manually.
+Keep the `MedRep sync:` line in ID-cell notes; other note text is preserved.
 
 Writes retain operation IDs through network retries. Doctor receipts recover the
 assigned ID, and visit receipts recover the saved visit and timestamp. Validation

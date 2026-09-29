@@ -177,10 +177,6 @@ async function postOperation(item: QueueItem): Promise<Record<string, unknown>> 
   if (item.action === 'upsertDoctor' && typeof (data.doctor as Doctor | undefined)?.id !== 'string') {
     throw new ProtocolError('Sheets has not confirmed this doctor. Deploy the updated Apps Script.')
   }
-  if (item.action === 'upsertDoctor' && (payload as Doctor).availability !== undefined
-    && !Array.isArray((data.doctor as Doctor | undefined)?.availability)) {
-    throw new ValidationError('Availability: update Apps Script and run setupSpreadsheet, then refresh to retry these call windows.')
-  }
   if (item.action !== 'undoVisit') {
     const record = (item.action === 'upsertDoctor' ? data.doctor : data.visit) as Doctor | Visit | undefined
     if (!record || !Number.isFinite(Date.parse(record.updatedAt))) throw new ProtocolError('Missing server timestamp. Deploy the updated Apps Script and correct/save this record again.')

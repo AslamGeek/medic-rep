@@ -2,13 +2,6 @@ export type Prescriber = 'Rx' | 'NRx'
 
 export type SyncState = 'pending' | 'synced' | 'error'
 
-export interface CallWindow {
-  days: string[]
-  from: string
-  until: string
-  notes: string
-}
-
 export interface RecordSync {
   updatedAt: string
   _synced: boolean
@@ -27,7 +20,6 @@ export interface Doctor extends RecordSync {
   stockist: string
   prescriber: Prescriber
   opTiming: string
-  availability?: CallWindow[]
   callSchedule: string
   prescribingProductIds: string[]
   notes: string

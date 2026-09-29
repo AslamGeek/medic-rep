@@ -15,6 +15,11 @@ const products = [
 ]
 
 function sheet(rows) {
+  const notes = new WeakMap()
+  const rowNotes = cells => {
+    if (!notes.has(cells)) notes.set(cells, [])
+    return notes.get(cells)
+  }
   return {
     rows,
     getLastRow: () => rows.length,
@@ -22,6 +27,10 @@ function sheet(rows) {
     appendRow: (row) => rows.push(row),
     insertRowBefore: row => rows.splice(row - 1, 0, []),
     deleteRow: (row) => rows.splice(row - 1, 1),
+    deleteColumn: column => rows.forEach(cells => {
+      cells.splice(column - 1, 1)
+      rowNotes(cells).splice(column - 1, 1)
+    }),
     setFrozenRows() {},
     getDataRange() { return this.getRange(1, 1, rows.length, rows[0].length) },
     getRange: (row, column, height = 1, width = 1) => ({
@@ -29,6 +38,10 @@ function sheet(rows) {
         .map((cells) => cells.slice(column - 1, column - 1 + width)),
       getDisplayValues() { return this.getValues() },
       getValue() { return this.getValues()[0]?.[0] || '' },
+      getNotes: () => rows.slice(row - 1, row - 1 + height)
+        .map(cells => Array.from({ length: width }, (_, index) => rowNotes(cells)[column - 1 + index] || '')),
+      getNote() { return this.getNotes()[0][0] },
+      setNote: note => { rowNotes(rows[row - 1])[column - 1] = note },
       setWrap() { return this },
       setFontWeight() { return this },
       setBackground() { return this },
@@ -73,7 +86,6 @@ function fixture() {
     Settings: sheet([Array.from(context.SHEET_HEADERS.Settings),
       ['Town', 'General', 'Proddatur', '', '', '', '']]),
     Visits: sheet([Array.from(context.SHEET_HEADERS.Visits)]),
-    DoctorAvailability: sheet([Array.from(context.SHEET_HEADERS.DoctorAvailability)]),
   }
   context.ACTIVE_SPREADSHEET_ = { getSheetByName: (name) => sheets[name] }
   const input = {
@@ -226,55 +238,20 @@ test('equivalent forms with more than one matching master row are not guessed', 
   assert.deepEqual(Array.from(context.productIdsFromCell_('PROD-007', products)), ['PROD-007'])
 })
 
-test('call windows round-trip through GAS and API, update without touching other doctors, and survive old clients', async (t) => {
-  const { context, sheets, input } = fixture()
-  const windows = [{ days: ['Tue', 'Fri'], from: '10:00', until: '11:00', notes: 'Morning calls' },
-    { days: ['Mon'], from: '14:00', until: '', notes: 'Confirm closing time' }]
-  const created = context.upsertDoctor_({ ...input, availability: windows }).doctor
-  const second = context.upsertDoctor_({ ...input, name: 'Another Doctor', availability: [windows[1]] }).doctor
-  assert.deepEqual(JSON.parse(JSON.stringify(context.getDoctors_()[0].availability)), windows)
-  t.mock.method(globalThis, 'fetch', async () => new Response(JSON.stringify(context.bootstrap_())))
-  let payload
-  await handler({ method: 'GET' }, { setHeader() {}, status(code) { assert.equal(code, 200); return this }, json(value) { payload = value } })
-  assert.deepEqual(payload.doctors.find(doctor => doctor.id === created.id).availability, windows)
-  const request = { postData: { contents: JSON.stringify({ action: 'upsertDoctor', opId: 'windows-op', payload: { ...created, availability: [windows[0]] } }) } }
-  assert.equal(context.doPost(request).success, true)
-  const retried = context.doPost(request)
-  assert.equal(retried.success, true)
-  assert.equal(retried.doctor.availability.length, 1)
-  assert.equal(sheets.DoctorAvailability.rows.length, 3)
-  const { availability: _unused, ...oldClient } = JSON.parse(JSON.stringify(created))
-  context.upsertDoctor_({ ...oldClient, notes: 'Old client edit' })
-  assert.equal(context.getDoctors_().find(doctor => doctor.id === created.id).availability.length, 1)
-  context.upsertDoctor_({ ...created, availability: [] })
-  assert.equal(context.getDoctors_().find(doctor => doctor.id === created.id).availability.length, 0)
-  assert.equal(context.getDoctors_().find(doctor => doctor.id === second.id).availability.length, 1)
-})
-
-test('invalid or unconfigured availability is rejected before any sheet write', () => {
-  const { context, sheets, input } = fixture()
-  assert.throws(() => context.upsertDoctor_({ ...input, availability: [{ days: ['Tue'], from: '14:00', until: '13:00' }] }), /Availability:/)
-  assert.equal(sheets.Doctors.rows.length, 1)
-  assert.equal(sheets.DoctorAvailability.rows.length, 1)
-  delete sheets.DoctorAvailability
-  assert.throws(() => context.upsertDoctor_({ ...input, availability: [] }), /Run setupSpreadsheet/)
-  assert.equal(sheets.Doctors.rows.length, 1)
-})
-
-
-test('setup adds DoctorAvailability without changing existing records and can run again', () => {
+test('setup creates only the four supported tabs and preserves existing records on repeat runs', () => {
   const { context, sheets, input } = fixture()
   context.upsertDoctor_(input)
-  delete sheets.DoctorAvailability
+  delete sheets.Visits
   const before = Object.fromEntries(Object.entries(sheets).map(([name, value]) => [name, JSON.stringify(value.rows)]))
   context.ACTIVE_SPREADSHEET_.insertSheet = name => sheets[name] = sheet([['']])
   context.setupSpreadsheet()
   context.setupSpreadsheet()
-  assert.deepEqual(Array.from(sheets.DoctorAvailability.rows[0]), ['Doctor ID', 'Days', 'From', 'Until', 'Notes'])
+  assert.deepEqual(sheets.Visits.rows[0], Array.from(context.SHEET_HEADERS.Visits))
+  assert.deepEqual(Object.keys(sheets).sort(), ['Doctors', 'Products', 'Settings', 'Visits'])
   for (const [name, rows] of Object.entries(before)) assert.equal(JSON.stringify(sheets[name].rows), rows)
 })
 
-test('GAS versions remain stable on reads and advance for direct Sheet and availability edits', () => {
+test('GAS versions remain stable on reads and advance for direct Sheet edits', () => {
   const { context, sheets, input } = fixture()
   const saved = context.upsertDoctor_(input).doctor
   assert.equal(context.getDoctors_()[0].updatedAt, saved.updatedAt)
@@ -282,8 +259,6 @@ test('GAS versions remain stable on reads and advance for direct Sheet and avail
   const edited = context.getDoctors_()[0]
   assert.ok(edited.updatedAt > saved.updatedAt)
   assert.equal(context.getDoctors_()[0].updatedAt, edited.updatedAt)
-  sheets.DoctorAvailability.rows.push([saved.id, 'Mon, Wed', '10:00', '11:00', ''])
-  assert.ok(context.getDoctors_()[0].updatedAt > edited.updatedAt)
 })
 
 test('visits retain IDs across row insertion, recover duplicate receipts, and accept offline dates', () => {
@@ -302,9 +277,97 @@ test('visits retain IDs across row insertion, recover duplicate receipts, and ac
   assert.equal(context.getVisits_().some(item => item.localId === visit.localId), false)
 })
 
-test('health verifies all five exact header sets and rejects invalid availability', () => {
+test('health verifies all four exact header sets and rejects missing required headers', () => {
   const { context, sheets } = fixture()
   assert.equal(context.health_().schemaVersion, 2)
-  sheets.DoctorAvailability.rows.push(['D-1', 'Mon, Wed', '25:00', '26:00', ''])
-  assert.throws(() => context.health_(), /Availability:/)
+  assert.deepEqual(Object.keys(context.health_().tabs).sort(), ['Doctors', 'Products', 'Settings', 'Visits'])
+  sheets.Doctors.rows[0][0] = 'Missing ID'
+  assert.throws(() => context.health_(), /missing exact headers ID/)
+})
+
+test('retired-tab cleanup deletes only DoctorAvailability and does not recreate it', () => {
+  const { context, sheets, input } = fixture()
+  const saved = context.upsertDoctor_({ ...input, availability: [{ days: ['Mon'], from: '09:00' }] }).doctor
+  assert.equal('availability' in saved, false)
+  sheets.DoctorAvailability = sheet([['Doctor ID', 'Days', 'From', 'Until', 'Notes'], [saved.id, 'Mon', '09:00', '', '']])
+  sheets.Custom = sheet([['Keep'], ['custom data']])
+  const kept = Object.fromEntries(Object.entries(sheets).filter(([name]) => name !== 'DoctorAvailability')
+    .map(([name, value]) => [name, JSON.stringify(value.rows)]))
+  const deleted = []
+  context.ACTIVE_SPREADSHEET_.deleteSheet = target => {
+    const name = Object.keys(sheets).find(name => sheets[name] === target)
+    deleted.push(name)
+    delete sheets[name]
+  }
+  context.removeDoctorAvailability()
+  context.removeDoctorAvailability()
+  context.setupSpreadsheet()
+  assert.deepEqual(deleted, ['DoctorAvailability'])
+  assert.equal(sheets.DoctorAvailability, undefined)
+  for (const [name, rows] of Object.entries(kept)) assert.equal(JSON.stringify(sheets[name].rows), rows)
+  assert.equal(context.getDoctors_()[0].updatedAt, saved.updatedAt)
+  assert.equal(context.bootstrap_().success, true)
+})
+
+test('removing legacy sync columns preserves versions, records, custom cells and user notes', () => {
+  const { context, sheets, input } = fixture()
+  const doctor = context.upsertDoctor_(input).doctor
+  const visit = context.saveVisit_({ localId: 'migrate-visit', date: '2020-01-01', camp: 'Proddatur', kind: 'Leave' }).visit
+  for (const [name, idHeader] of [['Doctors', 'ID'], ['Visits', 'Visit ID']]) {
+    const target = sheets[name]
+    const cell = target.getRange(2, target.rows[0].indexOf(idHeader) + 1)
+    const metadata = JSON.parse(cell.getNote().slice('MedRep sync: '.length))
+    // Recreate legacy storage, with metadata columns in different positions.
+    target.rows[0].unshift('SyncHash')
+    target.rows[1].unshift(metadata.hash)
+    target.rows[0].push('Custom', 'UpdatedAt')
+    target.rows[1].push('keep me', metadata.updatedAt)
+    target.getRange(2, target.rows[0].indexOf(idHeader) + 1).setNote('My own note')
+  }
+  const records = Object.fromEntries(['Doctors', 'Visits'].map(name => [name,
+    Object.fromEntries(sheets[name].rows[0].map((header, i) => [header, sheets[name].rows[1][i]])
+      .filter(([header]) => !['UpdatedAt', 'SyncHash'].includes(header)))]))
+  context.removeSyncColumns()
+  context.removeSyncColumns()
+  context.setupSpreadsheet()
+  for (const [name, idHeader] of [['Doctors', 'ID'], ['Visits', 'Visit ID']]) {
+    const target = sheets[name]
+    assert.equal(target.rows[0].includes('UpdatedAt'), false)
+    assert.equal(target.rows[0].includes('SyncHash'), false)
+    assert.deepEqual(Object.fromEntries(target.rows[0].map((header, i) => [header, target.rows[1][i]])), records[name])
+    assert.match(target.getRange(2, target.rows[0].indexOf(idHeader) + 1).getNote(), /^My own note\nMedRep sync: /)
+  }
+  assert.equal(context.getDoctors_()[0].updatedAt, doctor.updatedAt)
+  assert.equal(context.getVisits_()[0].updatedAt, visit.updatedAt)
+  assert.equal(context.health_().success, true)
+  const edited = context.upsertDoctor_({ ...doctor, notes: 'After migration' }).doctor
+  assert.ok(edited.updatedAt > doctor.updatedAt)
+  assert.equal(context.getDoctors_()[0].updatedAt, edited.updatedAt)
+  sheets.Visits.rows[1][sheets.Visits.rows[0].indexOf('Camp')] = 'Edited in Sheets'
+  assert.ok(context.getVisits_()[0].updatedAt > visit.updatedAt)
+})
+
+test('migration leaves columns intact if metadata cannot be saved', () => {
+  const { context, sheets, input } = fixture()
+  context.upsertDoctor_(input)
+  sheets.Doctors.rows[0].push('UpdatedAt', 'SyncHash')
+  sheets.Doctors.rows[1].push('2020-01-01T00:00:00.000Z', 'old hash')
+  const cell = sheets.Doctors.getRange(2, 1)
+  cell.setNote('')
+  const getRange = sheets.Doctors.getRange
+  sheets.Doctors.getRange = (...args) => ({ ...getRange(...args), setNote() { throw new Error('Cannot write metadata') } })
+  assert.throws(() => context.removeSyncColumns(), /Cannot write metadata/)
+  assert.ok(sheets.Doctors.rows[0].includes('UpdatedAt'))
+  assert.ok(sheets.Doctors.rows[0].includes('SyncHash'))
+})
+
+test('ID-cell versions follow sorted records and identical saves advance the acknowledged version', () => {
+  const { context, sheets, input } = fixture()
+  const first = context.upsertDoctor_(input).doctor
+  sheets.Settings.rows.push(['', '', 'Alpha', '', '', '', ''])
+  context.upsertDoctor_({ ...input, name: 'Sorted first', camp: 'Alpha' })
+  assert.equal(context.getDoctors_().find(record => record.id === first.id).updatedAt, first.updatedAt)
+  const saved = context.upsertDoctor_(first).doctor
+  assert.ok(saved.updatedAt > first.updatedAt)
+  assert.equal(context.getDoctors_().find(record => record.id === first.id).updatedAt, saved.updatedAt)
 })

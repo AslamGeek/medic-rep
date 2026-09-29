@@ -27,7 +27,9 @@ function csv(text) {
 try {
   const result = await fetch(url + '?action=health', { signal: AbortSignal.timeout(25000) })
   const data = await result.json()
-  const current = data.success && data.schemaVersion === 2 && data.availabilityValid
+  const current = data.success && data.schemaVersion === 2
+    && Object.keys(data.tabs || {}).length === Object.keys(context.SHEET_HEADERS).length
+    && Object.keys(context.SHEET_HEADERS).every(name => Array.isArray(data.tabs?.[name]))
   console.log('Public GAS access:', result.ok && data.success ? 'reachable without authentication' : 'FAILED')
   console.log('Versioned health:', current ? 'PASS' : 'FAIL: deploy the generated GAS bundle as a NEW version')
   if (!current) failed = true
@@ -45,18 +47,6 @@ for (const [name, required] of Object.entries(context.SHEET_HEADERS)) {
     const missing = required.filter(header => !headers.includes(header))
     console.log(name + ':', missing.length ? 'missing exact headers: ' + missing.join(', ') : 'PASS exact headers')
     if (missing.length) failed = true
-    if (name === 'DoctorAvailability' && !missing.length) {
-      const invalid = rows.flatMap((row, index) => {
-        if (!row.some(Boolean)) return []
-        const field = key => row[headers.indexOf(key)] || ''
-        const canonical = /^(Sun|Mon|Tue|Wed|Thu|Fri|Sat)(, (Sun|Mon|Tue|Wed|Thu|Fri|Sat))*$/.test(field('Days'))
-          && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(field('From'))
-          && (!field('Until') || /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(field('Until')) && field('Until') > field('From'))
-        return canonical ? [] : [index + 2]
-      })
-      console.log('Availability canonical Mon, Wed / HH:mm:', invalid.length ? 'invalid rows: ' + invalid.join(', ') : 'PASS (' + rows.filter(row => row.some(Boolean)).length + ' rows)')
-      if (invalid.length) failed = true
-    }
   } catch (error) { failed = true; console.log(name + ': FAILED ' + error.message) }
 }
 console.log('Execute as Me and deployment version selection require confirmation in the Apps Script deployment editor.')

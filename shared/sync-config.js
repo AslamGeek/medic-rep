@@ -1,4 +1,4 @@
-export const DEFAULT_GAS_WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbwNsenUjD1awLe-7e1QclXb8HCy11HcdjpCikZLIZJmw8wS3RtRWDJudURaMyMRiU5X/exec'
+export const DEFAULT_GAS_WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbzHTV9wlkDNV5YTag9YBaaDqg85ksTfEKlW97H26BL6hQdxLLM5kRmDkU1rmI_JdG8/exec'
 
 export function gasUrl(server, client) {
   if (server && client && server !== client) throw new Error('GAS_WEB_APP_URL and VITE_GAS_WEB_APP_URL must match')
