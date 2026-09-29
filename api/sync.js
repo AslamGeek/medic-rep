@@ -1,258 +1,46 @@
-import { createHash } from 'node:crypto'
-import { productIdsFromCell } from '../shared/products.js'
-import { availabilityFromRecords } from '../shared/availability.js'
+import { gasUrl } from '../shared/sync-config.js'
 
-const SPREADSHEET_ID = '1Zg5Rxn6TNskev1EFwwrZI9gWP1mDyifBg6ACI_YTFxU'
-const DEFAULT_GAS_WEB_APP_URL =
-  'https://script.google.com/macros/s/AKfycbxGzHJ5gF_TwPijKu8vzsfEu6wYMnUUqS_1XxLdfs7UmkW-CvOVFDyZGYL2pC-XqNi7/exec'
-
-function parseCsv(text) {
-  const rows = []
-  let row = []
-  let value = ''
-  let quoted = false
-
-  for (let index = 0; index < text.length; index += 1) {
-    const character = text[index]
-    if (quoted) {
-      if (character === '"' && text[index + 1] === '"') {
-        value += '"'
-        index += 1
-      } else if (character === '"') {
-        quoted = false
-      } else {
-        value += character
-      }
-    } else if (character === '"') {
-      quoted = true
-    } else if (character === ',') {
-      row.push(value)
-      value = ''
-    } else if (character === '\n') {
-      row.push(value.replace(/\r$/, ''))
-      rows.push(row)
-      row = []
-      value = ''
-    } else {
-      value += character
-    }
-  }
-
-  if (value || row.length) {
-    row.push(value.replace(/\r$/, ''))
-    rows.push(row)
-  }
-  return rows
-}
-
-function unique(values) {
-  const seen = new Set()
-  return values.filter((value) => {
-    const clean = String(value || '').trim()
-    const key = clean.toLocaleLowerCase()
-    if (!key || seen.has(key)) return false
-    seen.add(key)
-    return true
-  })
-}
-
-function cleanList(value) {
-  const text = String(value || '').trim()
-  if (!text) return []
-  return unique(text.split(/,|\n/).map((item) => item.trim()))
-}
-
-function records(csv, sheetName) {
-  const rows = parseCsv(csv)
-  const headers = rows.shift() || []
-  const required = {
-    Doctors: ['ID', 'Name', 'Specialties', 'Hospital', 'Pharmacy', 'Area', 'Camp', 'Potential', 'Stockist', 'Prescriber', 'OP Timing', 'Call Schedule', 'Prescribing Products', 'Notes'],
-    Visits: ['Date', 'Day', 'Camp', 'Doctors (count)', 'Pharmacy (count)', 'Doctors', 'Pharmacy'],
-    Settings: ['Areas', 'Specialties', 'Camps', 'Potentials', 'Stockist', 'OP Timings', 'Call Schedule'],
-    Products: ['ProdID', 'Name', 'DosageForm'],
-    DoctorAvailability: ['Doctor ID', 'Days', 'From', 'Until', 'Notes'],
-  }
-  if (!required[sheetName].every((header) => headers.includes(header))) {
-    throw new Error(`Invalid ${sheetName} response from Google Sheets`)
-  }
-  return rows
-    .filter((row) => row.some(Boolean))
-    .map((row) => Object.fromEntries(headers.map((header, index) => [header, row[index] || ''])))
-}
-
-async function readSheet(name, signal) {
-  const url = new URL(`https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/gviz/tq`)
-  url.searchParams.set('tqx', 'out:csv')
-  url.searchParams.set('sheet', name)
-  url.searchParams.set('_', Date.now().toString())
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      const result = await fetch(url, { cache: 'no-store', signal })
-      if (!result.ok) throw new Error(`Could not read the ${name} sheet`)
-      return records(await result.text(), name)
-    } catch (error) {
-      if (signal.aborted || attempt === 1) throw error
-    }
-  }
-}
-
-function makeVisit(row, index) {
-  const doctorLines = String(row.Doctors || '').split(/\r?\n/).filter(Boolean)
-  const pharmacyLines = String(row.Pharmacy || '').split(/\r?\n/).filter(Boolean)
-  const noVisit = doctorLines[0]?.startsWith('NO_VISIT:')
-    ? doctorLines[0].slice('NO_VISIT:'.length)
-    : ''
-  const kind = ['Sunday', 'Holiday', 'Leave'].includes(noVisit) ? noVisit : 'Visit'
-  const fingerprint = createHash('sha256')
-    .update([row.Date, row.Camp, row.Doctors, row.Pharmacy, index].join('|'))
-    .digest('base64url')
-    .slice(0, 18)
-
-  return {
-    localId: `server-${fingerprint}`,
-    date: String(row.Date || ''),
-    day: String(row.Day || ''),
-    camp: String(row.Camp || ''),
-    kind,
-    doctorIds: doctorLines.map((line) => {
-      const unnumbered = line.replace(/^\s*\d+\.\s*/, '')
-      const match = unnumbered.match(/^(.+?)\s+[—-]\s+/)
-      return match?.[1]?.trim() || ''
-    }).filter(Boolean),
-    doctorCount: Number(row['Doctors (count)']) || 0,
-    pharmacyCount: Number(row['Pharmacy (count)']) || 0,
-    doctorLines,
-    pharmacyLines,
-    createdAt: row.Date ? `${row.Date}T00:00:00.000Z` : new Date().toISOString(),
-    syncState: 'synced',
-  }
-}
-
-async function bootstrap(response) {
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), 20_000)
-  try {
-    const [doctorRows, visitRows, settingRows, productRows, availabilityRows] = await Promise.all([
-      readSheet('Doctors', controller.signal),
-      readSheet('Visits', controller.signal),
-      readSheet('Settings', controller.signal),
-      readSheet('Products', controller.signal),
-      readSheet('DoctorAvailability', controller.signal),
-    ])
-    const availability = availabilityFromRecords(availabilityRows)
-    const serverTime = new Date().toISOString()
-    const products = productRows.filter((row) => row.ProdID && row.Name).map((row) => ({
-      prodId: row.ProdID.trim(),
-      name: row.Name.trim(),
-      dosageForm: row.DosageForm.trim(),
-    }))
-    const settingColumn = (name) => unique(settingRows.map((row) => row[name]))
-    const payload = {
-      success: true,
-      doctors: doctorRows.filter((row) => row.ID).map((row) => ({
-        id: row.ID.trim(),
-        name: row.Name.trim(),
-        specialties: cleanList(row.Specialties),
-        hospital: row.Hospital.trim(),
-        pharmacy: row.Pharmacy.trim(),
-        area: row.Area.trim(),
-        camp: row.Camp.trim(),
-        potential: row.Potential.trim(),
-        stockist: row.Stockist.trim(),
-        prescriber: String(row.Prescriber).trim().toLocaleLowerCase() === 'rx' ? 'Rx' : 'NRx',
-        opTiming: row['OP Timing'].trim(),
-        availability: availability[row.ID.trim()] || [],
-        callSchedule: row['Call Schedule'].trim(),
-        prescribingProductIds: productIdsFromCell(row['Prescribing Products'], products),
-        notes: row.Notes.trim(),
-        updatedAt: serverTime,
-        syncState: 'synced',
-      })),
-      visits: visitRows.filter((row) => row.Date).map(makeVisit),
-      settings: {
-        areas: settingColumn('Areas'),
-        specialties: settingColumn('Specialties'),
-        camps: settingColumn('Camps'),
-        potentials: settingColumn('Potentials'),
-        stockists: settingColumn('Stockist'),
-        opTimings: settingColumn('OP Timings'),
-        callSchedules: settingColumn('Call Schedule'),
-      },
-      products,
-      serverTime,
-    }
-    response.setHeader('Cache-Control', 'no-store, max-age=0')
-    return response.status(200).json(payload)
-  } catch (error) {
-    const timedOut = error instanceof Error && error.name === 'AbortError'
-    return response.status(timedOut ? 504 : 502).json({
-      success: false,
-      message: timedOut ? 'Google Sheets took too long to respond'
-        : String(error?.message || '').includes('DoctorAvailability')
-          ? 'Could not read DoctorAvailability. Run setupSpreadsheet in the updated Apps Script, then refresh. If the tab already exists, check its headers and retry.'
-          : 'Could not read Google Sheets',
-    })
-  } finally {
-    clearTimeout(timer)
-  }
-}
-
-async function forwardWrite(request, response) {
-  const upstreamUrl = new URL(process.env.GAS_WEB_APP_URL || DEFAULT_GAS_WEB_APP_URL)
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), 50_000)
-  try {
-    const body = typeof request.body === 'string'
-      ? request.body
-      : JSON.stringify(request.body || {})
-
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      try {
-        const upstream = await fetch(upstreamUrl, {
-          method: 'POST',
-          headers: {
-            Accept: 'application/json,text/plain,*/*',
-            'Content-Type': 'text/plain;charset=utf-8',
-            // Google content redirects can fail even after a successful write.
-            // Reuse the operation ID on every retry so the write is deduplicated.
-            'User-Agent': 'Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 Chrome/140.0.0.0 Mobile Safari/537.36',
-          },
-          body,
-          cache: 'no-store',
-          redirect: 'follow',
-          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(22_000)]),
-        })
-        const text = await upstream.text()
-        const contentType = upstream.headers.get('content-type') || ''
-        if (upstream.ok && contentType.includes('application/json')) {
-          const data = JSON.parse(text)
-          if (typeof data.success !== 'boolean') throw new Error('Invalid Apps Script response')
-          response.setHeader('Cache-Control', 'no-store, max-age=0')
-          response.setHeader('Content-Type', 'application/json; charset=utf-8')
-          return response.status(200).send(text)
-        }
-      } catch (error) {
-        if (controller.signal.aborted || attempt === 1) throw error
-      }
-    }
-
-    throw new Error('Apps Script did not accept the change')
-  } catch (error) {
-    const timedOut = error instanceof Error && ['AbortError', 'TimeoutError'].includes(error.name)
-    return response.status(timedOut ? 504 : 502).json({
-      success: false,
-      message: timedOut
-        ? 'Saving to Google Sheets took too long; it will retry automatically'
-        : 'Google Sheets did not accept the change; it will retry automatically',
-    })
-  } finally {
-    clearTimeout(timer)
-  }
-}
-
+// Both directions use the same deployment and the same GAS serializers.
 export default async function handler(request, response) {
-  if (request.method === 'GET') return bootstrap(response)
-  if (request.method === 'POST') return forwardWrite(request, response)
-  response.setHeader('Allow', 'GET, POST')
-  return response.status(405).json({ success: false, message: 'Method not allowed' })
+  response.setHeader('Cache-Control', 'no-store, max-age=0')
+  if (!['GET', 'POST'].includes(request.method)) {
+    response.setHeader('Allow', 'GET, POST')
+    return response.status(405).json({ success: false, retryable: false, message: 'Method not allowed' })
+  }
+  let url
+  try {
+    url = new URL(gasUrl(process.env.GAS_WEB_APP_URL, process.env.VITE_GAS_WEB_APP_URL))
+  } catch (error) {
+    return response.status(400).json({ success: false, retryable: false, message: error.message })
+  }
+  if (request.method === 'GET') url.searchParams.set('action', request.query?.action === 'health' ? 'health' : 'bootstrap')
+  const body = request.method === 'POST'
+    ? typeof request.body === 'string' ? request.body : JSON.stringify(request.body || {})
+    : undefined
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const upstream = await fetch(url, {
+        method: request.method, body,
+        headers: { Accept: 'application/json', 'Content-Type': 'text/plain;charset=utf-8' },
+        cache: 'no-store', redirect: 'follow', signal: AbortSignal.timeout(22_000),
+      })
+      const transient = [408, 429, 500, 502, 503, 504].includes(upstream.status)
+      if (transient && attempt === 0) continue
+      if (!upstream.ok) return response.status(transient ? 503 : 400).json({
+        success: false, retryable: transient, message: 'Apps Script returned HTTP ' + upstream.status + '. Check deployment access and configuration.',
+      })
+      let data
+      try { data = JSON.parse(await upstream.text()) } catch {
+        return response.status(502).json({ success: false, retryable: false,
+          message: 'Apps Script returned HTML or invalid JSON. Deploy a new version with Execute as Me and access Anyone.' })
+      }
+      if (typeof data.success !== 'boolean') return response.status(400).json({ success: false, retryable: false, message: 'Invalid Apps Script response' })
+      return response.status(200).json(data)
+    } catch (error) {
+      const transient = error instanceof TypeError || ['AbortError', 'TimeoutError'].includes(error.name)
+      if (transient && attempt === 0) continue
+      return response.status(transient ? 503 : 400).json({ success: false, retryable: transient,
+        message: transient ? 'Google Sheets is temporarily unavailable.' : 'Could not contact the sync service.' })
+    }
+  }
 }

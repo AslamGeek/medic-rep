@@ -317,7 +317,9 @@ export function Visits({ doctors, visits, settings, defaultCamp, focusDoctorId, 
         ? pharmacies.map((pharmacy, index) => `${index + 1}. ${pharmacy}`)
         : [],
       createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
       syncState: 'pending',
+      _synced: false,
     }
 
     setSaving(true)

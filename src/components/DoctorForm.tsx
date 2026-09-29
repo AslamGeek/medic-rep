@@ -42,6 +42,7 @@ function emptyDoctor(): Doctor {
     notes: '',
     updatedAt: new Date().toISOString(),
     syncState: 'pending',
+      _synced: false,
   }
 }
 
@@ -131,6 +132,7 @@ export function DoctorForm({ doctor, doctors, master, onClose, onSave }: DoctorF
       prescribingProductIds: productIdsFromCell(references, master.products),
       updatedAt: new Date().toISOString(),
       syncState: 'pending',
+      _synced: false,
     }
     setSaving(true)
     try {

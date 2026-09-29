@@ -23,11 +23,11 @@ var SHEET_HEADERS = {
   Doctors: [
     'ID', 'Name', 'Specialties', 'Hospital', 'Pharmacy', 'Area', 'Camp',
     'Potential', 'Stockist', 'Prescriber', 'OP Timing', 'Call Schedule',
-    'Prescribing Products', 'Notes'
+    'Prescribing Products', 'Notes', 'UpdatedAt', 'SyncHash'
   ],
   Visits: [
     'Date', 'Day', 'Camp', 'Doctors (count)', 'Pharmacy (count)',
-    'Doctors', 'Pharmacy'
+    'Doctors', 'Pharmacy', 'Visit ID', 'Doctor IDs', 'UpdatedAt', 'SyncHash'
   ],
   Settings: [
     'Areas', 'Specialties', 'Camps', 'Potentials', 'Stockist',
@@ -58,7 +58,12 @@ var CAMP_CODE_MAP = {
 function doGet(e) {
   try {
     var action = e && e.parameter ? e.parameter.action : '';
-    if (action === 'bootstrap') return json_(bootstrap_());
+    if (action === 'health') return json_(health_());
+    if (action === 'bootstrap') {
+      var lock = LockService.getScriptLock();
+      lock.waitLock(20000);
+      try { return json_(bootstrap_()); } finally { lock.releaseLock(); }
+    }
     return json_({
       success: true,
       service: 'MedRep API',
@@ -94,6 +99,11 @@ function doPost(e) {
         });
         if (matches.length !== 1) throw new Error('Could not recover the saved doctor. Refresh and check the record.');
         previous.doctor = matches[0];
+      }
+      if (action === 'saveVisit') {
+        var savedVisitId = PropertiesService.getScriptProperties().getProperty('MEDREP_VISIT_OP_' + opId) || payload.localId;
+        previous.visit = getVisits_().filter(function (visit) { return visit.localId === savedVisitId; })[0];
+        if (!previous.visit) throw new Error('Could not recover the saved visit. Check the record in Sheets.');
       }
       return json_(previous);
     }
@@ -138,6 +148,10 @@ function setupSpreadsheet() {
     ensureSheet_(ss, name, SHEET_HEADERS[name]);
   });
 
+  // Assign durable identities and versions to legacy rows without replacing data.
+  getDoctors_();
+  getVisits_();
+  SpreadsheetApp.flush();
   return 'MedRep spreadsheet is ready.';
 }
 
@@ -172,7 +186,14 @@ function ensureSheet_(ss, name, expectedHeaders) {
 
   var headers = readHeaders_(sheet);
   expectedHeaders.forEach(function (header) {
-    columnIndex_(headers, header);
+    // Append only new sync columns; canonicalize recognized legacy header names.
+    if (['UpdatedAt', 'SyncHash', 'Visit ID', 'Doctor IDs'].indexOf(header) !== -1 && headers.indexOf(header) === -1) {
+      headers.push(header);
+      sheet.getRange(1, headers.length).setValues([[header]]);
+    } else {
+      var index = columnIndex_(headers, header);
+      if (headers[index] !== header) sheet.getRange(1, index + 1).setValues([[header]]);
+    }
   });
 }
 
@@ -281,6 +302,7 @@ function jsonError_(error) {
   console.error(error && error.stack ? error.stack : error);
   return json_({
     success: false,
+    retryable: /timed out|too many times|temporarily|internal error|service unavailable|lock/i.test(String(error && error.message)),
     message: error && error.message ? error.message : String(error || 'Unknown error')
   });
 }
@@ -531,7 +553,8 @@ function doctorFromRow_(headers, row, products) {
     callSchedule: cleanText_(valueAt_(headers, row, 'Call Schedule'), 120),
     prescribingProductIds: productIdsFromCell_(valueAt_(headers, row, 'Prescribing Products'), products),
     notes: cleanText_(valueAt_(headers, row, 'Notes'), 500),
-    updatedAt: new Date().toISOString(),
+    updatedAt: isoTimestamp_(valueAt_(headers, row, 'UpdatedAt')),
+    _synced: true,
     syncState: 'synced'
   };
 }
@@ -543,16 +566,18 @@ function getDoctors_(products) {
   products = products || getProducts_();
   var availability = getDoctorAvailability_();
   return rows
-    .map(function (row) { return doctorFromRow_(headers, row, products); })
-    .filter(Boolean).map(function (doctor) {
+    .map(function (row, index) {
+      var doctor = doctorFromRow_(headers, row, products);
+      if (!doctor) return null;
       doctor.availability = availability[doctor.id] || [];
+      stampRecord_(sheet, headers, row, index + 2, doctor);
       return doctor;
-    });
+    }).filter(Boolean);
 }
 
 function getDoctorAvailability_() {
   var sheet = spreadsheet_().getSheetByName('DoctorAvailability');
-  if (!sheet) return {};
+  if (!sheet) throw new Error('Missing DoctorAvailability sheet. Run setupSpreadsheet once.');
   var rows = sheet.getDataRange().getDisplayValues();
   var headers = rows.shift();
   SHEET_HEADERS.DoctorAvailability.forEach(function (name) { columnIndex_(headers, name); });
@@ -639,7 +664,9 @@ function doctorCellValue_(doctor, canonical, products) {
     'Prescribing Products': doctor.prescribingProductIds.map(function (id) {
       return productLabel_(products.filter(function (product) { return product.prodId === id; })[0]);
     }).join(', '),
-    'Notes': doctor.notes
+    'Notes': doctor.notes,
+    'UpdatedAt': doctor.updatedAt,
+    'SyncHash': ''
   };
   return map[canonical];
 }
@@ -705,6 +732,9 @@ function upsertDoctor_(input, lockHeld) {
       ? rows[rowNumber - 2].slice()
       : new Array(headers.length).fill('');
 
+    doctor.updatedAt = new Date(Math.max(Date.now(),
+      (Date.parse(valueAt_(headers, existingRow, 'UpdatedAt')) || 0) + 1)).toISOString();
+
     SHEET_HEADERS.Doctors.forEach(function (canonical) {
       existingRow[columnIndex_(headers, canonical)] = doctorCellValue_(doctor, canonical, products);
     });
@@ -719,7 +749,7 @@ function upsertDoctor_(input, lockHeld) {
       sheet.appendRow(existingRow);
     }
     sortDoctorRows_(sheet);
-    return { doctor: doctor };
+    return { doctor: getDoctors_(products).filter(function (item) { return item.id === doctor.id; })[0] };
   } finally {
     if (!lockHeld) lock.releaseLock();
   }
@@ -735,7 +765,7 @@ function visitDay_(dateString) {
 function validateVisitDate_(value) {
   var date = cleanText_(value, 20);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error('A valid visit date is required.');
-  if (date < localDate_(new Date())) throw new Error('Past dates cannot be logged.');
+  // Offline visits may reconnect on a later day. The UI controls date selection.
   return date;
 }
 
@@ -778,7 +808,14 @@ function saveVisit_(input, lockHeld) {
   try {
     var sheet = sheet_('Visits');
     var headers = readHeaders_(sheet);
+    var visitId = cleanText_(input.localId, 120);
+    if (!visitId) throw new Error('Visit ID is required.');
+    var existing = getVisits_().filter(function (visit) { return visit.localId === visitId; })[0];
+    if (existing) return { visit: existing };
     var row = new Array(headers.length).fill('');
+    row[columnIndex_(headers, 'Visit ID')] = visitId;
+    row[columnIndex_(headers, 'Doctor IDs')] = doctorIds.join(', ');
+    row[columnIndex_(headers, 'UpdatedAt')] = new Date().toISOString();
     row[columnIndex_(headers, 'Date')] = date;
     row[columnIndex_(headers, 'Day')] = visitDay_(date);
     row[columnIndex_(headers, 'Camp')] = camp;
@@ -790,7 +827,7 @@ function saveVisit_(input, lockHeld) {
     sheet.getRange(2, 1, 1, headers.length).setValues([row]);
     sheet.getRange(2, columnIndex_(headers, 'Doctors') + 1).setWrap(true);
     sheet.getRange(2, columnIndex_(headers, 'Pharmacy') + 1).setWrap(true);
-    return { visit: visitFromRow_(headers, row, 2), doctorIds: doctorIds };
+    return { visit: getVisits_().filter(function (visit) { return visit.localId === visitId; })[0], doctorIds: doctorIds };
   } finally {
     if (!lockHeld) lock.releaseLock();
   }
@@ -815,9 +852,10 @@ function undoVisit_(input, lockHeld) {
     for (var index = 0; index < rows.length; index++) {
       var rowDoctors = cleanText_(rows[index][doctorsIndex], 5000).replace(/\r\n/g, '\n');
       if (
+        (input.localId ? valueAt_(headers, rows[index], 'Visit ID') === input.localId :
         displayDateValue_(rows[index][dateIndex]) === targetDate &&
         cleanText_(rows[index][campIndex], 120) === targetCamp &&
-        rowDoctors === targetDoctors
+        rowDoctors === targetDoctors)
       ) {
         sheet.deleteRow(index + 2);
         return { removed: true };
@@ -829,7 +867,7 @@ function undoVisit_(input, lockHeld) {
   }
 }
 
-function visitFromRow_(headers, row, sheetRow) {
+function visitFromRow_(headers, row) {
   var date = displayDateValue_(valueAt_(headers, row, 'Date'));
   var doctorsText = cleanText_(valueAt_(headers, row, 'Doctors'), 5000).replace(/\r\n/g, '\n');
   var doctorLines = doctorsText ? doctorsText.split('\n').filter(Boolean) : [];
@@ -843,25 +881,20 @@ function visitFromRow_(headers, row, sheetRow) {
     return separator > 0 ? unnumbered.slice(0, separator).trim() : '';
   }).filter(Boolean);
 
-  var fingerprint = Utilities.base64EncodeWebSafe(
-    Utilities.computeDigest(
-      Utilities.DigestAlgorithm.SHA_256,
-      [date, valueAt_(headers, row, 'Camp'), doctorsText, pharmacyText, sheetRow].join('|')
-    )
-  ).slice(0, 18);
-
   return {
-    localId: 'server-' + fingerprint,
+    localId: cleanText_(valueAt_(headers, row, 'Visit ID'), 120),
     date: date,
     day: cleanText_(valueAt_(headers, row, 'Day'), 20) || visitDay_(date),
     camp: cleanText_(valueAt_(headers, row, 'Camp'), 120),
     kind: kind,
-    doctorIds: doctorIds,
+    doctorIds: cleanList_(valueAt_(headers, row, 'Doctor IDs')).length ? cleanList_(valueAt_(headers, row, 'Doctor IDs')) : doctorIds,
     doctorCount: Number(valueAt_(headers, row, 'Doctors (count)')) || 0,
     pharmacyCount: Number(valueAt_(headers, row, 'Pharmacy (count)')) || 0,
     doctorLines: doctorLines,
     pharmacyLines: pharmacyLines,
     createdAt: date ? date + 'T00:00:00.000Z' : new Date().toISOString(),
+    updatedAt: isoTimestamp_(valueAt_(headers, row, 'UpdatedAt')),
+    _synced: true,
     syncState: 'synced'
   };
 }
@@ -870,7 +903,17 @@ function getVisits_() {
   var sheet = sheet_('Visits');
   var rows = sheet.getDataRange().getValues();
   var headers = rows.shift().map(function (value) { return String(value).trim(); });
-  return rows.map(function (row, index) { return visitFromRow_(headers, row, index + 2); })
+  return rows.map(function (row, index) {
+    if (!valueAt_(headers, row, 'Date')) return null;
+    var idColumn = columnIndex_(headers, 'Visit ID');
+    if (!row[idColumn]) {
+      row[idColumn] = 'sheet-' + Utilities.getUuid();
+      sheet.getRange(index + 2, idColumn + 1).setValues([[row[idColumn]]]);
+    }
+    var visit = visitFromRow_(headers, row, index + 2);
+    stampRecord_(sheet, headers, row, index + 2, visit);
+    return visit;
+  }).filter(Boolean)
     .filter(function (visit) { return visit.date; })
     .sort(function (a, b) {
       if (a.date === b.date) return b.localId.localeCompare(a.localId);
@@ -882,6 +925,7 @@ function bootstrap_() {
   var products = getProducts_();
   return {
     success: true,
+    schemaVersion: 2,
     doctors: getDoctors_(products),
     visits: getVisits_(),
     settings: getSettings_(),
@@ -907,12 +951,15 @@ function wasProcessed_(opId) {
 
 function rememberOperation_(opId, result) {
   var properties = PropertiesService.getScriptProperties();
+  if (result.visit) properties.setProperty('MEDREP_VISIT_OP_' + opId, result.visit.localId);
   if (result.doctor) properties.setProperty('MEDREP_DOCTOR_OP_' + opId, result.doctor.id);
   var operations = processedOperations_();
   operations.push(opId);
   // Leave room below the per-property size limit, even for non-UUID IDs.
   while (operations.length > CONFIG.MAX_REMEMBERED_OPERATIONS || JSON.stringify(operations).length > 2000) {
-    properties.deleteProperty('MEDREP_DOCTOR_OP_' + operations.shift());
+    var expired = operations.shift();
+    properties.deleteProperty('MEDREP_DOCTOR_OP_' + expired);
+    properties.deleteProperty('MEDREP_VISIT_OP_' + expired);
   }
   properties.setProperty(
     'MEDREP_PROCESSED_OPS',
@@ -920,59 +967,38 @@ function rememberOperation_(opId, result) {
   );
 }
 
-// BEGIN SHARED AVAILABILITY (shared/availability.js)
-// Keep the portable helpers in sync with the marked block in gas/Code.gs.
-const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
 
-function parseDays(value) {
-  const text = String(value || '').trim().toLowerCase()
-  if (/^(everyday|every day|daily|all days)$/.test(text)) return [...WEEKDAYS]
-  const tokens = text.split(/\s*(?:,|&|\/|\band\b)\s*/).filter(Boolean)
-  const names = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday']
-  const days = tokens.map(token => WEEKDAYS.find((day, index) => token === day.toLowerCase() || token === names[index]))
-  return days.length && days.every(Boolean) ? [...new Set(days)] : []
+// Stable versions also detect direct Sheet edits, pasted ranges, scripts and
+// availability changes. Reads advance a version only when content has changed.
+function isoTimestamp_(value) {
+  var millis = new Date(value).getTime();
+  return isFinite(millis) ? new Date(millis).toISOString() : '';
 }
 
-function parseClock(value) {
-  const text = String(value || '').trim().toLowerCase().replace(/\./g, '')
-  const match = text.match(/^(\d{1,2})(?::(\d{2}))?(?::00)?\s*(am|pm)?$/)
-  if (!match) return ''
-  let hour = Number(match[1])
-  const minute = Number(match[2] || 0)
-  if (minute > 59 || (match[3] ? hour < 1 || hour > 12 : hour > 23)) return ''
-  if (match[3]) hour = hour % 12 + (match[3] === 'pm' ? 12 : 0)
-  return String(hour).padStart(2, '0') + ':' + String(minute).padStart(2, '0')
+function stampRecord_(sheet, headers, row, rowNumber, record) {
+  var content = Object.assign({}, record);
+  delete content.updatedAt;
+  delete content._synced;
+  delete content.syncState;
+  var hash = Utilities.base64EncodeWebSafe(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, JSON.stringify(content)));
+  var hashColumn = columnIndex_(headers, 'SyncHash');
+  var versionColumn = columnIndex_(headers, 'UpdatedAt');
+  if (row[hashColumn] !== hash || !record.updatedAt) {
+    record.updatedAt = new Date(Math.max(Date.now(), (Date.parse(record.updatedAt) || 0) + 1)).toISOString();
+    sheet.getRange(rowNumber, versionColumn + 1).setValues([[record.updatedAt]]);
+    sheet.getRange(rowNumber, hashColumn + 1).setValues([[hash]]);
+  }
 }
 
-function validateAvailability(windows) {
-  if (!Array.isArray(windows) || windows.length > 14) throw new Error('Availability: use up to 14 time windows.')
-  return windows.map(window => {
-    if (!window || !Array.isArray(window.days) || !window.days.length || window.days.some(day => !WEEKDAYS.includes(day))) {
-      throw new Error('Availability: select at least one valid weekday for each window.')
-    }
-    if (!/^\d{2}:\d{2}$/.test(window.from || '') || parseClock(window.from) !== window.from) {
-      throw new Error('Availability: enter a valid start time for each window.')
-    }
-    const until = window.until || ''
-    if (until && (!/^\d{2}:\d{2}$/.test(until) || parseClock(until) !== until || until <= window.from)) {
-      throw new Error('Availability: closing time must be after start time on the same day.')
-    }
-    return { days: WEEKDAYS.filter(day => window.days.includes(day)), from: window.from, until,
-      notes: String(window.notes || '').trim().slice(0, 200) }
-  })
+function health_() {
+  var tabs = {};
+  Object.keys(SHEET_HEADERS).forEach(function (name) {
+    var headers = readHeaders_(sheet_(name));
+    var missing = SHEET_HEADERS[name].filter(function (header) { return headers.indexOf(header) === -1; });
+    if (missing.length) throw new Error(name + ': missing exact headers ' + missing.join(', '));
+    tabs[name] = headers;
+  });
+  var availability = getDoctorAvailability_();
+  Object.keys(availability).forEach(function (id) { validateAvailability(availability[id]); });
+  return { success: true, schemaVersion: 2, spreadsheetId: CONFIG.SPREADSHEET_ID, tabs: tabs, availabilityValid: true };
 }
-
-function availabilityFromRecords(records) {
-  const byDoctor = Object.create(null)
-  records.forEach(row => {
-    const id = String(row['Doctor ID'] || '').trim()
-    if (!id) return
-    const window = { days: parseDays(row.Days), from: parseClock(row.From) || String(row.From || ''),
-      until: parseClock(row.Until) || String(row.Until || ''), notes: String(row.Notes || '').trim() }
-    if (!byDoctor[id]) byDoctor[id] = []
-    byDoctor[id].push(window)
-  })
-  return byDoctor
-}
-
-// END SHARED AVAILABILITY

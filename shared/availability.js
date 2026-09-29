@@ -1,4 +1,4 @@
-// Keep the portable helpers in sync with the marked block in gas/Code.gs.
+// Single source for browser and generated Apps Script. Run npm run build:gas.
 const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
 
 function parseDays(value) {

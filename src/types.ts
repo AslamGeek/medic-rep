@@ -9,7 +9,12 @@ export interface CallWindow {
   notes: string
 }
 
-export interface Doctor {
+export interface RecordSync {
+  updatedAt: string
+  _synced: boolean
+}
+
+export interface Doctor extends RecordSync {
   id: string
   isNewRecord?: boolean
   name: string
@@ -53,8 +58,9 @@ export interface MasterData {
 
 export type VisitKind = 'Visit' | 'Sunday' | 'Holiday' | 'Leave'
 
-export interface Visit {
+export interface Visit extends RecordSync {
   localId: string
+  _legacyId?: boolean
   date: string
   day: string
   camp: string
@@ -70,7 +76,7 @@ export interface Visit {
 
 export type QueueAction = 'upsertDoctor' | 'saveVisit' | 'undoVisit'
 
-export interface QueueItem {
+export interface QueueItem extends RecordSync {
   id?: number
   opId: string
   action: QueueAction
@@ -79,6 +85,8 @@ export interface QueueItem {
   createdAt: string
   attempts: number
   validationError?: string
+  retryStopped?: boolean
+  failureMessage?: string
 }
 
 export interface FilterState {
@@ -91,20 +99,21 @@ export interface FilterState {
   prescriber: Prescriber[]
 }
 
-export interface FilterPreset {
+export interface FilterPreset extends RecordSync {
   id: string
   name: string
   filters: FilterState
   updatedAt: string
 }
 
-export interface MetaRecord<T = unknown> {
+export interface MetaRecord<T = unknown> extends RecordSync {
   key: string
   value: T
 }
 
 export interface BootstrapPayload {
   success: boolean
+  schemaVersion: number
   doctors: Doctor[]
   visits: Visit[]
   settings: MasterSettings

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import handler from '../api/sync.js'
+import { gasUrl, DEFAULT_GAS_WEB_APP_URL } from '../shared/sync-config.js'
 
 function capture() {
   return { headers: {}, setHeader(key, value) { this.headers[key] = value },
@@ -33,4 +34,34 @@ test('an HTML error page must never become a successful empty spreadsheet', asyn
   await handler({ method: 'GET' }, response)
   assert.equal(response.body.success, false)
   assert.equal(response.code, 502)
+  assert.equal(response.body.retryable, false)
+})
+
+test('GET and POST use the same GAS deployment and never the CSV endpoint', async (t) => {
+  const urls = []
+  t.mock.method(globalThis, 'fetch', async url => {
+    urls.push(new URL(url))
+    return new Response(JSON.stringify({ success: true }))
+  })
+  await handler({ method: 'GET' }, capture())
+  await handler({ method: 'POST', body: {} }, capture())
+  assert.equal(urls[0].origin + urls[0].pathname, urls[1].origin + urls[1].pathname)
+  assert.equal(urls[0].searchParams.get('action'), 'bootstrap')
+  assert.equal(urls[0].hostname, 'script.google.com')
+})
+
+test('configuration rejects mismatched deployments and non-exec URLs', () => {
+  assert.equal(gasUrl(), DEFAULT_GAS_WEB_APP_URL)
+  assert.equal(gasUrl(undefined, DEFAULT_GAS_WEB_APP_URL), DEFAULT_GAS_WEB_APP_URL)
+  assert.throws(() => gasUrl(DEFAULT_GAS_WEB_APP_URL, DEFAULT_GAS_WEB_APP_URL.replace('/exec', '/dev')), /must match/)
+  assert.throws(() => gasUrl('https://example.com/exec'), /deployed Apps Script/)
+})
+
+test('permanent HTTP errors and validation responses do not trigger proxy retries', async (t) => {
+  let calls = 0
+  t.mock.method(globalThis, 'fetch', async () => { calls++; return new Response('Forbidden', { status: 403 }) })
+  const rejected = capture()
+  await handler({ method: 'POST', body: {} }, rejected)
+  assert.equal(calls, 1)
+  assert.equal(rejected.body.retryable, false)
 })

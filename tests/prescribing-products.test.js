@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
 import vm from 'node:vm'
 import test from 'node:test'
 import handler from '../api/sync.js'
+import { bundleGas } from '../scripts/build-gas.js'
 
 const products = [
   ['PROD-001', 'Alpha', 'Tablet'],
@@ -19,6 +20,7 @@ function sheet(rows) {
     getLastRow: () => rows.length,
     getLastColumn: () => rows[0].length,
     appendRow: (row) => rows.push(row),
+    insertRowBefore: row => rows.splice(row - 1, 0, []),
     deleteRow: (row) => rows.splice(row - 1, 1),
     setFrozenRows() {},
     getDataRange() { return this.getRange(1, 1, rows.length, rows[0].length) },
@@ -27,6 +29,7 @@ function sheet(rows) {
         .map((cells) => cells.slice(column - 1, column - 1 + width)),
       getDisplayValues() { return this.getValues() },
       getValue() { return this.getValues()[0]?.[0] || '' },
+      setWrap() { return this },
       setFontWeight() { return this },
       setBackground() { return this },
       setFontColor() { return this },
@@ -52,6 +55,7 @@ function fixture() {
   const properties = new Map()
   const context = vm.createContext({
     console,
+    Utilities: { getUuid: randomUUID, DigestAlgorithm: { SHA_256: "sha256" }, computeDigest: (algorithm, value) => createHash(algorithm).update(value).digest(), base64EncodeWebSafe: value => Buffer.from(value).toString("base64url") },
     SpreadsheetApp: { flush() {} },
     LockService: { getScriptLock: () => ({ waitLock() {}, releaseLock() {} }) },
     PropertiesService: { getScriptProperties: () => ({
@@ -62,7 +66,7 @@ function fixture() {
     ContentService: { MimeType: { JSON: 'application/json' },
       createTextOutput: (text) => ({ setMimeType: () => JSON.parse(text) }) },
   })
-  vm.runInContext(readFileSync(new URL('../gas/Code.gs', import.meta.url), 'utf8'), context)
+  vm.runInContext(bundleGas(), context)
   const sheets = {
     Doctors: sheet([Array.from(context.SHEET_HEADERS.Doctors)]),
     Products: sheet([['ProdID', 'Name', 'DosageForm'], ...products.map((row) => [...row])]),
@@ -102,12 +106,7 @@ test('both read paths resolve labels and legacy IDs to selectable product IDs', 
   const { context, sheets, input } = fixture()
   context.upsertDoctor_(input)
   const column = sheets.Doctors.rows[0].indexOf('Prescribing Products')
-  t.mock.method(globalThis, 'fetch', async (url) => ({
-    ok: true,
-    text: async () => sheets[new URL(url).searchParams.get('sheet')].rows
-      .map((row) => row.map((value) => `"${String(value).replaceAll('"', '""')}"`).join(','))
-      .join('\n'),
-  }))
+  t.mock.method(globalThis, 'fetch', async () => new Response(JSON.stringify(context.bootstrap_())))
   for (const [stored, expected] of [
     ['PROD-001, PROD-002', ['PROD-001', 'PROD-002']],
     ['Alpha (Tablet)\nAlpha (Syrup)', ['PROD-001', 'PROD-002']],
@@ -227,15 +226,14 @@ test('equivalent forms with more than one matching master row are not guessed', 
   assert.deepEqual(Array.from(context.productIdsFromCell_('PROD-007', products)), ['PROD-007'])
 })
 
-test('call windows round-trip through GAS and CSV, update without touching other doctors, and survive old clients', async (t) => {
+test('call windows round-trip through GAS and API, update without touching other doctors, and survive old clients', async (t) => {
   const { context, sheets, input } = fixture()
   const windows = [{ days: ['Tue', 'Fri'], from: '10:00', until: '11:00', notes: 'Morning calls' },
     { days: ['Mon'], from: '14:00', until: '', notes: 'Confirm closing time' }]
   const created = context.upsertDoctor_({ ...input, availability: windows }).doctor
   const second = context.upsertDoctor_({ ...input, name: 'Another Doctor', availability: [windows[1]] }).doctor
   assert.deepEqual(JSON.parse(JSON.stringify(context.getDoctors_()[0].availability)), windows)
-  t.mock.method(globalThis, 'fetch', async url => ({ ok: true, text: async () =>
-    sheets[new URL(url).searchParams.get('sheet')].rows.map(row => row.map(value => `"${String(value).replaceAll('"', '""')}"`).join(',')).join('\n') }))
+  t.mock.method(globalThis, 'fetch', async () => new Response(JSON.stringify(context.bootstrap_())))
   let payload
   await handler({ method: 'GET' }, { setHeader() {}, status(code) { assert.equal(code, 200); return this }, json(value) { payload = value } })
   assert.deepEqual(payload.doctors.find(doctor => doctor.id === created.id).availability, windows)
@@ -263,11 +261,6 @@ test('invalid or unconfigured availability is rejected before any sheet write', 
   assert.equal(sheets.Doctors.rows.length, 1)
 })
 
-test('Apps Script availability helpers match the shared source exactly', () => {
-  const gas = readFileSync(new URL('../gas/Code.gs', import.meta.url), 'utf8').replaceAll('\r\n', '\n')
-  const shared = readFileSync(new URL('../shared/availability.js', import.meta.url), 'utf8').replaceAll('\r\n', '\n').replace(/^export \{.*\}\n?/m, '')
-  assert.equal(gas.split('// BEGIN SHARED AVAILABILITY (shared/availability.js)\n')[1].split('// END SHARED AVAILABILITY')[0], shared)
-})
 
 test('setup adds DoctorAvailability without changing existing records and can run again', () => {
   const { context, sheets, input } = fixture()
@@ -279,4 +272,39 @@ test('setup adds DoctorAvailability without changing existing records and can ru
   context.setupSpreadsheet()
   assert.deepEqual(Array.from(sheets.DoctorAvailability.rows[0]), ['Doctor ID', 'Days', 'From', 'Until', 'Notes'])
   for (const [name, rows] of Object.entries(before)) assert.equal(JSON.stringify(sheets[name].rows), rows)
+})
+
+test('GAS versions remain stable on reads and advance for direct Sheet and availability edits', () => {
+  const { context, sheets, input } = fixture()
+  const saved = context.upsertDoctor_(input).doctor
+  assert.equal(context.getDoctors_()[0].updatedAt, saved.updatedAt)
+  sheets.Doctors.rows[1][sheets.Doctors.rows[0].indexOf('Name')] = 'Edited in Sheets'
+  const edited = context.getDoctors_()[0]
+  assert.ok(edited.updatedAt > saved.updatedAt)
+  assert.equal(context.getDoctors_()[0].updatedAt, edited.updatedAt)
+  sheets.DoctorAvailability.rows.push([saved.id, 'Mon, Wed', '10:00', '11:00', ''])
+  assert.ok(context.getDoctors_()[0].updatedAt > edited.updatedAt)
+})
+
+test('visits retain IDs across row insertion, recover duplicate receipts, and accept offline dates', () => {
+  const { context, sheets } = fixture()
+  const visit = { localId: 'offline-visit', date: '2020-01-01', camp: 'Proddatur', kind: 'Leave' }
+  const request = { postData: { contents: JSON.stringify({ action: 'saveVisit', opId: 'visit-op', payload: visit }) } }
+  const saved = context.doPost(request)
+  assert.equal(saved.success, true)
+  assert.equal(saved.visit.localId, visit.localId)
+  assert.equal(context.doPost(request).visit.updatedAt, saved.visit.updatedAt)
+  context.saveVisit_({ ...visit, localId: 'second-visit' })
+  const loaded = context.getVisits_().find(item => item.localId === visit.localId)
+  assert.equal(loaded.updatedAt, saved.visit.updatedAt)
+  assert.equal(sheets.Visits.rows.length, 3)
+  context.undoVisit_(saved.visit)
+  assert.equal(context.getVisits_().some(item => item.localId === visit.localId), false)
+})
+
+test('health verifies all five exact header sets and rejects invalid availability', () => {
+  const { context, sheets } = fixture()
+  assert.equal(context.health_().schemaVersion, 2)
+  sheets.DoctorAvailability.rows.push(['D-1', 'Mon, Wed', '25:00', '26:00', ''])
+  assert.throws(() => context.health_(), /Availability:/)
 })

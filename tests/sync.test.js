@@ -32,14 +32,14 @@ function table(key) {
   }
 }
 
-const doctor = { id: 'PDTR-001', name: 'Updated name', syncState: 'pending', prescribingProductIds: [] }
-const bootstrap = { success: true, doctors: [], visits: [], settings: {}, products: [], serverTime: 'now' }
+const doctor = { updatedAt: '2026-09-02T00:00:00.000Z', _synced: true, id: 'PDTR-001', name: 'Updated name', syncState: 'pending', prescribingProductIds: [] }
+const bootstrap = { schemaVersion: 2, success: true, doctors: [], visits: [], settings: {}, products: [], serverTime: '2026-09-03T00:00:00.000Z' }
 const response = (data) => ({ ok: true, text: async () => JSON.stringify(data) })
 const tick = () => new Promise((resolve) => setImmediate(resolve))
 function deferred() { let resolve; const promise = new Promise((r) => { resolve = r }); return { promise, resolve } }
 
-function setup(fetch) {
-  const db = { doctors: table('id'), visits: table('localId'), queue: table('id'), meta: table('key'),
+function setup(fetch, options = {}) {
+  const db = options.db || { doctors: table('id'), visits: table('localId'), queue: table('id'), meta: table('key'),
     transaction: async (...args) => args.at(-1)() }
   const events = []
   const timers = new Map()
@@ -51,8 +51,9 @@ function setup(fetch) {
     clearTimeout: (id) => timers.delete(id),
   }
   const exports = {}
+  const navigator = { onLine: true, locks: options.locks }
   const context = vm.createContext({
-    exports, window, navigator: { onLine: true }, crypto, URL, AbortController, DOMException,
+    Error, TypeError, exports, window, navigator, crypto, URL, AbortController, DOMException,
     CustomEvent, console, setTimeout, clearTimeout,
     require: (name) => {
       if (name === './db') return { db, setMeta: (key, value) => db.meta.put({ key, value }) }
@@ -64,7 +65,7 @@ function setup(fetch) {
   })
   const source = readFileSync(new URL('../src/sync.ts', import.meta.url), 'utf8')
   vm.runInContext(ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText, context)
-  return { db, sync: exports, events, timers }
+  return { db, sync: exports, events, timers, navigator }
 }
 
 test('a failed refresh does not prevent an already queued doctor save', async () => {
@@ -93,7 +94,7 @@ test('an older Apps Script response cannot silently acknowledge unsaved call win
   assert.deepEqual((await db.doctors.get(doctor.id)).availability, pendingDoctor.availability)
 })
 
-test('an edit sends immediately even while refresh is waiting for Sheets', async () => {
+test('an edit waits until the active refresh finishes before pushing', async () => {
   const read = deferred()
   const calls = []
   const { db, sync } = setup(async (_url, init) => {
@@ -108,11 +109,30 @@ test('an edit sends immediately even while refresh is waiting for Sheets', async
   const save = sync.syncNow()
   await tick()
   try {
-    assert.ok(calls.includes('POST'), 'The save waited for the slow refresh')
+    assert.equal(calls.includes('POST'), false, 'Push overlapped an active pull')
   } finally {
     read.resolve(response(bootstrap))
     await Promise.all([refresh, save])
   }
+})
+
+test('pull preserves a newer confirmed local record', async () => {
+  const { db, sync } = setup(async () => response({ ...bootstrap,
+    doctors: [{ ...doctor, name: 'Stale sheet', updatedAt: '2026-09-01T00:00:00.000Z' }],
+  }))
+  await db.doctors.put({ ...doctor, _synced: true, syncState: 'synced', updatedAt: '2026-09-02T00:00:00.000Z' })
+  await sync.syncNow()
+  assert.equal((await db.doctors.get(doctor.id)).name, doctor.name)
+})
+
+test('pull preserves and reports an unsynced record even without a queue entry', async () => {
+  const { db, sync, events } = setup(async () => response({ ...bootstrap,
+    doctors: [{ ...doctor, name: 'Sheet edit', updatedAt: '2026-09-03T00:00:00.000Z' }],
+  }))
+  await db.doctors.put({ ...doctor, _synced: false, updatedAt: '2026-09-02T00:00:00.000Z' })
+  await sync.syncNow()
+  assert.equal((await db.doctors.get(doctor.id)).name, doctor.name)
+  assert.ok(events.at(-1).conflicts?.some(item => item.id === doctor.id))
 })
 
 test('an older save acknowledgement cannot overwrite a newer local edit', async () => {
@@ -147,7 +167,7 @@ test('a failed write automatically retries after two seconds without fetching Sh
   const { db, sync, timers } = setup(async (_url, init) => {
     assert.equal(init.method, 'POST')
     attempts += 1
-    if (attempts === 1) throw new Error('Temporary network failure')
+    if (attempts === 1) throw new TypeError('Temporary network failure')
     return response({ success: true, doctor })
   })
   await sync.queueChange('upsertDoctor', doctor.id, doctor)
@@ -215,7 +235,7 @@ test('failed earlier edits cannot be overtaken by newer edits for the same docto
 test('undo during an in-flight visit save uses the canonical row and does not resurrect the visit', async () => {
   const save = deferred()
   const visit = { localId: 'visit-1', doctorIds: [], doctorLines: ['Client name'], syncState: 'pending' }
-  const canonical = { ...visit, localId: 'server-visit-1', doctorLines: ['Canonical name'] }
+  const canonical = { ...visit, updatedAt: '2026-09-03T00:00:00.000Z', localId: 'server-visit-1', doctorLines: ['Canonical name'] }
   const posted = []
   const { db, sync } = setup(async (_url, init) => {
     const operation = JSON.parse(init.body)
@@ -235,7 +255,7 @@ test('undo during an in-flight visit save uses the canonical row and does not re
 
 test('on-demand refresh imports direct Sheet edits when no local change is pending', async () => {
   const { db, sync } = setup(async () => response({
-    ...bootstrap, doctors: [{ ...doctor, name: 'Name edited in Sheets' }],
+    ...bootstrap, doctors: [{ ...doctor, name: 'Name edited in Sheets', updatedAt: '2026-09-03T00:00:00.000Z' }],
   }))
   await db.doctors.put({ ...doctor, syncState: 'synced' })
   await sync.syncNow()
@@ -276,4 +296,112 @@ test('a validation rejection pauses automatic retry and a corrected edit replace
   assert.notEqual(sent[0].opId, sent[1].opId)
   assert.equal(sent[1].payload.name, 'Corrected edit')
   assert.equal(await db.queue.count(), 0)
+})
+
+test('offline edits persist and become confirmed on reconnection', async () => {
+  const { db, sync, navigator } = setup(async () => response({ success: true, doctor }))
+  navigator.onLine = false
+  await sync.queueChange('upsertDoctor', doctor.id, doctor)
+  assert.equal((await db.doctors.get(doctor.id))._synced, false)
+  assert.equal(await db.queue.count(), 1)
+  navigator.onLine = true
+  await sync.flushChanges()
+  assert.equal((await db.doctors.get(doctor.id))._synced, true)
+  assert.equal((await db.doctors.get(doctor.id)).updatedAt, doctor.updatedAt)
+  assert.equal(await db.queue.count(), 0)
+})
+
+test('refresh defers while a failed write remains queued', async () => {
+  const methods = []
+  const { db, sync, events } = setup(async (_url, init) => {
+    methods.push(init.method)
+    throw new TypeError('fetch failed')
+  })
+  await sync.queueChange('upsertDoctor', doctor.id, doctor)
+  await sync.syncNow()
+  assert.deepEqual(methods, ['POST'])
+  assert.equal(await db.queue.count(), 1)
+  assert.ok(events.at(-1).conflicts.some(item => item.id === doctor.id))
+})
+
+test('refresh never retries master-list validation failures', async () => {
+  let calls = 0
+  const { db, sync, timers } = setup(async () => {
+    calls++
+    return response({ success: false, message: 'Area must come from the spreadsheet master list.' })
+  })
+  await sync.queueChange('upsertDoctor', doctor.id, doctor)
+  await sync.flushChanges()
+  await sync.syncNow()
+  await sync.retrySync()
+  assert.equal(calls, 1)
+  assert.ok((await db.queue.toArray())[0].validationError)
+  assert.equal(timers.size, 0)
+})
+
+test('transient retries stop after eight attempts and manual retry preserves the operation ID', async () => {
+  const posted = []
+  const { db, sync, timers } = setup(async (_url, init) => {
+    if (init.method === 'GET') return response(bootstrap)
+    posted.push(JSON.parse(init.body).opId)
+    if (posted.length <= 8) throw new TypeError('fetch failed')
+    return response({ success: true, doctor })
+  })
+  const opId = await sync.queueChange('upsertDoctor', doctor.id, doctor)
+  await sync.flushChanges()
+  for (let i = 1; i < 8; i++) await sync.flushChanges()
+  assert.equal((await db.queue.toArray())[0].retryStopped, true)
+  assert.equal(timers.size, 0)
+  await sync.flushChanges()
+  assert.equal(posted.length, 8)
+  await sync.retrySync()
+  assert.equal(posted.length, 9)
+  assert.ok(posted.every(id => id === opId))
+  assert.equal(await db.queue.count(), 0)
+})
+
+test('non-transient API failures do not retry automatically', async () => {
+  const { db, sync, timers } = setup(async () => ({ ok: false, status: 502,
+    text: async () => JSON.stringify({ success: false, retryable: false, message: 'Deploy Apps Script' }) }))
+  await sync.queueChange('upsertDoctor', doctor.id, doctor)
+  await sync.flushChanges()
+  assert.equal((await db.queue.toArray())[0].retryStopped, true)
+  assert.equal(timers.size, 0)
+})
+
+test('a second browser tab cannot push while the first tab is pulling', async () => {
+  let tail = Promise.resolve()
+  const locks = { request(_name, work) { const next = tail.then(work); tail = next.catch(() => {}); return next } }
+  const read = deferred()
+  let posts = 0
+  const fetch = async (_url, init) => {
+    if (init.method === 'GET') return read.promise
+    posts++
+    return response({ success: true, doctor })
+  }
+  const first = setup(fetch, { locks })
+  const second = setup(fetch, { locks, db: first.db })
+  const refresh = first.sync.syncNow()
+  await tick()
+  await second.sync.queueChange('upsertDoctor', doctor.id, doctor)
+  await tick()
+  assert.equal(posts, 0)
+  read.resolve(response({ ...bootstrap, doctors: [{ ...doctor, name: 'Stale' }] }))
+  await refresh
+  await second.sync.flushChanges()
+  assert.equal(posts, 1)
+  assert.equal((await first.db.doctors.get(doctor.id)).name, doctor.name)
+})
+
+test('legacy confirmed visit IDs reconcile without duplicating rows or touching pending work', async () => {
+  const visit = { localId: 'new-stable-id', date: '2026-09-20', camp: 'Camp', kind: 'Leave',
+    doctorLines: ['NO_VISIT:Leave'], pharmacyLines: [], updatedAt: '2026-09-20T00:00:00.000Z', _synced: true }
+  const { db, sync } = setup(async () => response({ ...bootstrap, visits: [visit] }))
+  await db.visits.put({ ...visit, localId: 'server-old-hash', _legacyId: true, updatedAt: '1970-01-01T00:00:00.000Z' })
+  await db.visits.put({ ...visit, localId: 'pending-id', _legacyId: true, _synced: false })
+  await sync.syncNow()
+  assert.equal(await db.visits.count(), 2)
+  assert.equal(await db.visits.get('server-old-hash'), undefined)
+  assert.equal((await db.visits.get('pending-id'))._synced, false)
+  assert.equal((await db.visits.get(visit.localId))._synced, true)
 })

@@ -27,6 +27,25 @@ class MedRepDatabase extends Dexie {
       presets: 'id, name, updatedAt',
       meta: 'key',
     })
+    this.version(2).stores({
+      doctors: 'id, name, area, camp, prescriber, callSchedule, updatedAt, syncState, *specialties, *prescribingProductIds',
+      visits: 'localId, date, camp, kind, createdAt, updatedAt, syncState, *doctorIds',
+      queue: '++id, &opId, action, entityId, createdAt',
+      presets: 'id, name, updatedAt',
+      meta: 'key',
+    }).upgrade(async tx => {
+      const pending = await tx.table('queue').toArray() as QueueItem[]
+      const epoch = '1970-01-01T00:00:00.000Z'
+      for (const name of ['doctors', 'visits', 'queue', 'presets', 'meta']) {
+        await tx.table(name).toCollection().modify(record => {
+          record.updatedAt = Number.isFinite(Date.parse(record.updatedAt)) ? record.updatedAt : epoch
+          const id = name === 'doctors' ? record.id : record.localId
+          record._synced = ['doctors', 'visits'].includes(name) && record.syncState === 'synced'
+            && !pending.some(item => item.entityId === id)
+          if (name === 'visits') record._legacyId = true
+        })
+      }
+    })
   }
 }
 
@@ -57,7 +76,7 @@ export async function loadSnapshot(): Promise<AppSnapshot> {
 }
 
 export async function setMeta<T>(key: string, value: T): Promise<void> {
-  await db.meta.put({ key, value })
+  await db.meta.put({ key, value, updatedAt: new Date().toISOString(), _synced: false })
 }
 
 export async function getMeta<T>(key: string): Promise<T | undefined> {

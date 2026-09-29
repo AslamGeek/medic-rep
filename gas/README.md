@@ -1,103 +1,55 @@
-# Google Apps Script setup
+# Google Apps Script deployment
 
-## Visit now update — required setup
+1. From the repository root run `npm run build:gas` (also part of `npm run build`).
+2. Replace the Apps Script project's `Code.gs` with **`gas/dist/Code.gs`**.
+   `gas/Code.gs` is source only and deliberately does not contain the parser.
+3. Run **setupSpreadsheet** again. It creates missing tabs, canonicalizes legacy
+   headers, appends `UpdatedAt` / `SyncHash` and visit identity columns, and
+   initializes existing record versions without clearing records.
+4. **Deploy → Manage deployments → Edit → New version → Deploy**.
+   Confirm **Execute as: Me** and **Who has access: Anyone**. Keep the deployment URL.
+5. Match Vercel `GAS_WEB_APP_URL` and local `.env` `VITE_GAS_WEB_APP_URL` (or the
+   shared default imported by `vite.config.ts`). Deploy the matching frontend/API.
+6. Run `npm run check:deployment`. The `/exec?action=health` and
+   `/api/sync?action=health` responses must contain `schemaVersion: 2`, all five
+   exact header sets, and `availabilityValid: true`.
 
-1. Replace the Apps Script project's `Code.gs` with this version.
-2. Run **setupSpreadsheet** once. It adds the new **DoctorAvailability** tab;
-   existing doctor, visit, product, and settings rows are preserved.
-3. **Deploy → Manage deployments → Edit → New version → Deploy**, retaining
-   the existing deployment URL.
-4. Push/deploy the matching app to Vercel and reopen it.
+Both reads and writes now go through the same Apps Script deployment. A Google
+CSV endpoint is used only by the read-only deployment diagnostic, never app sync.
+See the repository README for the exact header checklist and smoke tests.
 
-Add weekdays and start/end times using **Edit doctor → Availability → Add call
-window**. The app stores each window as a separate DoctorAvailability row, keyed
-by doctor ID. `Days` contains comma-separated weekday names, `From` and `Until`
-use `HH:mm`, and `Notes` is optional. An empty Until means the closing time is
-unknown. Multiple rows support different days and morning/evening windows.
-Direct Sheet edits are retrieved on refresh. Custom card orders are stored per
-camp on each device and do not change Sheet row order.
+## Parser source
 
-Deploy Apps Script and create the tab **before** deploying the frontend/API.
-Old clients that omit availability do not delete existing call windows.
+Edit only `shared/availability.js`, then rebuild. Never manually copy parser
+logic into this source or the generated artifact. `npm test` executes the
+same cases against the browser module and generated Apps Script bundle.
 
-## Existing connection
+DoctorAvailability has one window per row, with headers `Doctor ID`, `Days`,
+`From`, `Until`, `Notes`. Use `Mon, Wed` and `HH:mm` 24-hour times; Until can be
+blank, otherwise it must follow From on the same day.
 
-The app is already configured for spreadsheet:
+## Versioning and retries
 
-`1Zg5Rxn6TNskev1EFwwrZI9gWP1mDyifBg6ACI_YTFxU`
+Doctor/visit records store UpdatedAt and a content hash in the sheet. Bootstrap
+uses a script lock shared with writes and updates versions only for changed
+content, including availability edits. This detects manual edits, pasted ranges,
+and edits made by other scripts without requiring an onEdit trigger. Visit IDs
+remain stable through row insertion and sorting; old rows receive IDs during setup.
+Do not edit the sync metadata columns manually.
 
-The current web-app deployment is:
+Writes retain operation IDs through network retries. Doctor receipts recover the
+assigned ID, and visit receipts recover the saved visit and timestamp. Validation
+errors require a corrected local save and do not retry on refresh. Transient
+failures retry at most eight times; manual retry preserves the original operation ID.
+Past visit dates are accepted so records made offline can sync on a later day.
 
-`https://script.google.com/macros/s/AKfycbxGzHJ5gF_TwPijKu8vzsfEu6wYMnUUqS_1XxLdfs7UmkW-CvOVFDyZGYL2pC-XqNi7/exec`
+## Existing data helpers
 
-1. Open the Apps Script project used for the web-app URL.
-2. Replace its `Code.gs` with the included `Code.gs`.
-3. Run `setupSpreadsheet` once from the editor and approve spreadsheet access.
-4. Run `normalizeProductIds` once. This safely converts legacy product IDs to
-   `PROD-001`, `PROD-002`, ... and updates matching doctor references.
-5. Choose **Deploy → Manage deployments → Edit**.
-6. Select **New version**, execute as **Me**, allow access to **Anyone**, and deploy.
-7. If Vercel has a `GAS_WEB_APP_URL` environment variable, update it to the resulting `/exec` URL and redeploy. Otherwise the API uses the checked-in default. The local development proxy uses the URL in `vite.config.ts`.
+`normalizeProductIds` converts legacy product IDs to `PROD-###` and updates
+matching doctor references; it also installs the existing product edit trigger.
+`sortDoctors` optionally sorts Doctors by Camp then ID. App doctor saves perform
+this same sort. Prescribing Products stores readable `Name (DosageForm)` labels;
+legacy IDs and labels continue to resolve against Products.
 
-The setup is non-destructive. A blank `Sheet1` is reused as `Doctors`; only the missing agreed tabs and headers are created. Existing rows are not cleared or replaced.
-
-After migration, editing or pasting product rows in the `Products` tab automatically
-assigns any missing or invalid IDs in the same `PROD-###` format.
-
-## Prescribing products storage
-
-New and edited doctors store `Name (DosageForm)` in **Prescribing Products**,
-with multiple products separated by commas in the same cell. A product without
-a dosage form stores its name alone.
-The app still uses product IDs internally for selection and validation. Both
-read paths accept existing ID cells and the readable labels.
-
-To activate this change, deploy the updated `api/sync.js` to Vercel, then replace
-the Apps Script `Code.gs` and update its existing web-app deployment to a new
-version. Existing doctor rows are converted when saved again; no bulk migration
-is required.
-
-## Sync reliability update
-
-Deploy the matching Vercel frontend/API and this Apps Script version together.
-The frontend sends queued changes immediately, independently of refreshing, and
-automatically retries transient failures. The API retries failed connections and
-invalid Google responses while retaining the same operation ID.
-
-This Apps Script version checks operation receipts and performs writes under one
-lock. If the Google response is lost after creating a doctor, a retry returns the
-assigned doctor ID instead of just a duplicate flag. Master data and doctor rows
-are read in batches to reduce service calls. Existing queued changes are preserved.
-
-Validate deployment by renaming a known test doctor, checking its Sheets row and
-the **Saved to Sheets** indicator, then editing the name in Sheets and tapping
-refresh. Measure end-to-end write time on the deployed app; local regression tests
-do not establish a production latency guarantee.
-
-## Updating an existing deployment
-
-### Automatic doctor row ordering
-
-Every doctor saved from the app sorts the Doctors tab by Camp (A–Z), then ID
-(ascending). For example, `PDTR-016` appears immediately after `PDTR-015` in the
-same camp group. Sorting includes all populated columns and excludes the header.
-IDs are retained; row ordering does not change visit references.
-
-Replace `Code.gs` and deploy a new version of the existing Apps Script deployment
-to activate this behavior. Optionally run `sortDoctors` once in the Apps Script
-editor to sort existing records immediately; otherwise the next app doctor save
-sorts them. Direct edits in Sheets are sorted on the next app doctor save or by
-running `sortDoctors`.
-
-### Deployment steps
-
-A GitHub push and Vercel deployment do **not** update Apps Script. Replace the
-Apps Script project's `Code.gs` with this file, save it, then open **Deploy →
-Manage deployments → Edit → Version → New version → Deploy**. Keep the existing
-deployment URL. The previous `setupSpreadsheet` and `normalizeProductIds` setup
-steps do not need to be rerun for this code update.
-
-After both deployments are updated, reopen the app and tap refresh. Queued doctor
-edits can resolve older product labels such as `API-TOP  (Syrup)` to current master
-IDs before resending. Any label that no longer has an unambiguous master match is
-shown in the edit form so the user can remove or reselect it.
+A GitHub push or Vercel deployment does not deploy Apps Script. Always generate
+and deploy the GAS artifact explicitly, then verify the new version.

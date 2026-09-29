@@ -26,7 +26,7 @@ import { DoctorDetail } from './components/DoctorDetail'
 import { DoctorForm } from './components/DoctorForm'
 import { Visits } from './components/Visits'
 import { VisitNow } from './components/VisitNow'
-import { onSyncStatus, queueChange, syncNow, type SyncDetail } from './sync'
+import { onSyncStatus, queueChange, syncNow, retrySync, type SyncDetail } from './sync'
 import { dayName, formatDate, localDateString, normalize } from './utils'
 import {
   EMPTY_FILTERS,
@@ -324,6 +324,7 @@ function App() {
       name,
       filters: structuredClone(nextFilters),
       updatedAt: new Date().toISOString(),
+      _synced: false,
     }
     await db.presets.put(preset)
     await reload()
@@ -396,7 +397,7 @@ function App() {
           {installPrompt && <button className="icon-button" onClick={install} aria-label="Install app"><Download size={19} /></button>}
           <SyncBadge
             detail={syncDetail}
-            onRetry={() => void syncNow().then(reload)}
+            onRetry={() => void retrySync().then(reload)}
           />
           <button className="icon-button" onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')} aria-label={`Use ${theme === 'light' ? 'dark' : 'light'} theme`}>
             {theme === 'light' ? <Moon size={19} /> : <Sun size={19} />}
@@ -417,9 +418,19 @@ function App() {
       {syncDetail.phase === 'error' && !needsApiSetup && (
         <div className="setup-banner" role="status">
           {syncDetail.message}
-          {syncDetail.requiresAttention
-            ? ' Your changes are kept on this device. Edit the named doctor to correct the selection, or refresh after updating the master list.'
+          {syncDetail.retryPaused
+            ? ' Your changes are kept on this device. Tap the cloud icon after resolving the connection or deployment issue.'
+            : syncDetail.requiresAttention
+            ? ' Your changes are kept on this device. Correct the named record and save it again.'
             : syncDetail.pending ? ' Your changes are kept on this device and will retry automatically.' : ' Tap refresh to try again.'}
+        </div>
+      )}
+
+      {Boolean(syncDetail.conflicts?.length) && (
+        <div className="setup-banner" role="status">
+          <div><strong>Local changes preserved</strong><ul>
+            {syncDetail.conflicts?.map((item, index) => <li key={item.entity + item.id + index}>{item.label}: {item.reason}</li>)}
+          </ul></div>
         </div>
       )}
 
